@@ -17,12 +17,7 @@ FC1; its mandatory grid barrier orders initialization before FC2 reduction.
 The output is cast to BF16 once after FC2. Relaxed FP32 atomic ordering is
 not a bitwise-deterministic summation contract.
 
-Set `B12X_W4A16_STABLE_ROUTE_PACK=1` before plan declaration to retain
-ascending token-major route order within each expert for capacities of at
-least 4096 routed rows. This stabilizes expert packing, not floating-point
-atomic accumulation order. Smaller capacity plans retain atomic packing.
-
-Both options are captured in the immutable MoE query. Changing the process
+The option is captured in the immutable MoE query. Changing the process
 environment after declaration does not alter scratch geometry or dispatch.
 Preparation compiles and retains capacity-specialized programs. Binding
 maps caller-owned storage and accepts live token counts within that capacity;

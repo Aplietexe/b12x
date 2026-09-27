@@ -94,15 +94,13 @@ def _control_snapshot() -> FrozenMapping:
     """Capture host controls once while declaring the immutable query."""
     from . import _impl
     from b12x.moe._shared.kernels.w4a16.host import (
-        prefill_fused_sum_enabled, trellis_decode_table,
+        prefill_fused_sum_enabled,
     )
 
     tile = _impl._dynamic_tile_mn_override()
     raw_materialized = _impl.os.environ.get(_impl._DYNAMIC_NVFP4_MATERIALIZED_ENV)
     return FrozenMapping({
-        "trellis_decode_table": trellis_decode_table(),
         "w4a16_prefill_fused_sum": prefill_fused_sum_enabled(),
-        "w4a16_stable_route_pack": _impl._env_flag("B12X_W4A16_STABLE_ROUTE_PACK", default=False),
         "dynamic_nvfp4_materialized": (
             None if raw_materialized is None else raw_materialized not in ("", "0", "false", "False")
         ),
@@ -255,8 +253,6 @@ def _lower_caps(
         w4a16_prefill_fused_sum=bool(
             query.controls.get("w4a16_prefill_fused_sum", False)
         ),
-        w4a16_stable_route_pack=bool(query.controls.get("w4a16_stable_route_pack", False)),
-        trellis_decode_table=str(query.controls.get("trellis_decode_table", "auto")),
         swiglu_beta=_decode_scalar(query.swiglu_beta),
     )
 
@@ -444,7 +440,6 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
         route_pack = compile_w4a16_route_pack_launches(
             tokens=tokens, topk=core.num_topk, block_size=int(route_block),
             num_experts=core.route_E, ordinal=core.device.index,
-            stable_order=caps.w4a16_stable_route_pack,
         )
     # Direct routing requires exact M; packed routing accepts live M up to capacity.
     return _W4A16PrimaryLaunches(
