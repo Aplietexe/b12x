@@ -93,10 +93,14 @@ def _quant_mode(experts: PreparedExperts, config: MoeDecodeConfig) -> str:
 def _control_snapshot() -> FrozenMapping:
     """Capture host controls once while declaring the immutable query."""
     from . import _impl
+    from b12x.moe._shared.kernels.w4a16.host import (
+        prefill_fused_sum_enabled,
+    )
 
     tile = _impl._dynamic_tile_mn_override()
     raw_materialized = _impl.os.environ.get(_impl._DYNAMIC_NVFP4_MATERIALIZED_ENV)
     return FrozenMapping({
+        "w4a16_prefill_fused_sum": prefill_fused_sum_enabled(),
         "dynamic_nvfp4_materialized": (
             None if raw_materialized is None else raw_materialized not in ("", "0", "false", "False")
         ),
@@ -246,6 +250,9 @@ def _lower_caps(
                             if config.w4a16_block_size_m is not None
                             else query.w4a16_block_size_m),
         w4a16_fast_math=query.fast_math,
+        w4a16_prefill_fused_sum=bool(
+            query.controls.get("w4a16_prefill_fused_sum", False)
+        ),
         swiglu_beta=_decode_scalar(query.swiglu_beta),
     )
 
@@ -370,6 +377,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
         props = torch.cuda.get_device_properties(core.device)
         compiler_args = dict(
             size_m=tokens, hidden_size=core.k, intermediate_size=core.n,
+            direct_token_capacity=int(caps.max_tokens),
             num_experts=core.weight_E, top_k=core.num_topk,
             activation=core.activation,
             apply_router_weight_on_input=caps.apply_router_weight_on_input,
@@ -387,9 +395,11 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
         )
         packed = compile_w4a16_fused_moe(
             **compiler_args, zero_fc2_output=False, max_m_blocks=packed_blocks,
+            prefill_fused_sum_fp32=core.prefill_fused_sum_fp32,
         )
         packed_mapped = compile_w4a16_fused_moe(
             **compiler_args, zero_fc2_output=True, max_m_blocks=packed_blocks,
+            prefill_fused_sum_fp32=core.prefill_fused_sum_fp32,
         )
         direct = direct_mapped = None
         if weight_layout in BLOCK_CODECS:
@@ -580,6 +590,8 @@ def _program_carriers(
     launches = [item[-1] for item in scratch._prewarmed_fused_launches]
     launches.extend(item[-1] for item in scratch._prewarmed_topk_sum_launches)
     launches.extend(item[-1] for item in scratch._mixed_trellis_launches)
+    if scratch._prewarmed_route_pack_launches is not None:
+        launches.extend(scratch._prewarmed_route_pack_launches.carriers())
     plan = scratch.launch_plan
     if plan.implementation == "w4a16" and not scratch.full_rotation:
         launches.extend(
