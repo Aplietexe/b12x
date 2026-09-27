@@ -640,7 +640,7 @@ def get_vocab_argmax_launcher(
             current_cuda_stream(),
         )
 
-    return run
+    return attach_programs(run, raw)
 
 
 __all__ = ["SLAB_BYTES", "get_vocab_argmax_launcher"]

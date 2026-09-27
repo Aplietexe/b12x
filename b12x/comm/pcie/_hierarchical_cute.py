@@ -918,7 +918,7 @@ def get_hierarchical_launcher(
             current_cuda_stream(),
         )
 
-    return run
+    return attach_programs(run, raw)
 
 
 __all__ = ["get_hierarchical_launcher"]
