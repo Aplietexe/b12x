@@ -94,6 +94,116 @@ def test_prepare_fills_plans_in_place_and_release_runs_closers(tmp_path):
     assert b.plan.prepared is None
 
 
+def test_job_bundle_memo_ends_at_completion_but_plan_programs_survive(tmp_path):
+    import weakref
+    from b12x._lib import compile_plan, program_cache
+
+    built = []
+    key = compile_plan.ProgramKey("cute", "7" * 64, "job-owned")
+
+    @program_cache.program_cache
+    def executable():
+        return compile_plan.CompiledCuTeProgram(lambda: 23, key)
+
+    @program_cache.program_cache(scope="preparation")
+    def factory():
+        built.append(1)
+        return executable()
+
+    def make(name):
+        plan = replace(declaration(), _materialize=lambda *_: compile_plan.load_programs(factory()))
+        return plan.request(name=name, prepare_call=lambda state: PreparedCall(run=state))
+
+    with session(tmp_path, autotune=False) as engine:
+        requests = (make("a"), make("b"))
+        job = engine.begin(requests)
+        while not job.advance().done:
+            pass
+        assert not job._program_cache._caches
+        assert built == [1]
+        owner = weakref.ref(requests[0].plan.prepared.state)
+        assert owner() is requests[1].plan.prepared.state
+        engine.release_many((requests[0].plan,))
+        assert requests[1].plan.prepared.state() == 23
+        assert executable.cache_info().currsize == 1
+        engine.release_many((requests[1].plan,))
+        assert executable.cache_info().currsize == 0
+        assert owner() is None
+        engine.prepare((make("later"),))
+        assert built == [1, 1]
+
+
+def test_bulk_release_attempts_all_closers_and_reclaims_once(tmp_path, monkeypatch):
+    closed, reclaimed = [], []
+
+    def close(name):
+        closed.append(name)
+        if name == "a":
+            raise RuntimeError("closer failed")
+
+    with session(tmp_path) as engine:
+        requests = tuple(request(name=name, close=lambda name=name: close(name)) for name in ("a", "b"))
+        engine.prepare(requests)
+        reclaim = engine._reclaim_programs
+        monkeypatch.setattr(engine, "_reclaim_programs", lambda: (reclaimed.append(1), reclaim()))
+        with pytest.raises(RuntimeError, match="closer failed"):
+            engine.release_many(item.plan for item in requests)
+        assert closed == ["a", "b"]
+        assert reclaimed == [1]
+        assert all(item.plan.prepared is None for item in requests)
+        engine.release_many(item.plan for item in requests)
+        assert reclaimed == [1]
+
+
+def test_closing_one_session_preserves_another_sessions_executable(tmp_path):
+    from b12x._lib import compile_plan, program_cache
+
+    @program_cache.program_cache
+    def executable():
+        return compile_plan.CompiledCuTeProgram(lambda: 41, compile_plan.ProgramKey("cute", "6" * 64))
+
+    def make(name):
+        plan = replace(declaration(), _materialize=lambda *_: compile_plan.load_programs(executable()))
+        return plan.request(name=name, prepare_call=lambda state: PreparedCall(run=state))
+
+    with session(tmp_path, autotune=False) as first, session(tmp_path, autotune=False) as second:
+        a, b = make("a"), make("b")
+        first.prepare((a,))
+        second.prepare((b,))
+        first.close()
+        assert b.plan.prepared.state() == 41
+        assert executable.cache_info().currsize == 1
+        second.close()
+        assert executable.cache_info().currsize == 0
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_job_factory_scope_clears_on_failure_or_early_close(tmp_path, cancel):
+    from b12x._lib.program_cache import PreparationProgramCache, program_cache
+
+    @program_cache(scope="preparation")
+    def factory():
+        return SimpleNamespace(value=3)
+
+    def fail(state):
+        raise RuntimeError("binding failed")
+
+    plan = replace(declaration(), _materialize=lambda *_: factory())
+    with session(tmp_path, autotune=False) as engine:
+        job = engine.begin((plan.request(name="a", prepare_call=fail),))
+        if cancel:
+            with job._program_cache.activate():
+                factory()
+            job.close()
+        else:
+            with pytest.raises(RuntimeError, match="binding failed"):
+                while not job.advance().done:
+                    pass
+        assert not job._program_cache._caches
+        with PreparationProgramCache().activate():
+            assert factory().value == 3
+
+
 def test_plan_scoped_persistent_owners_reserve_independent_buffers(tmp_path):
     buffers = {}
 

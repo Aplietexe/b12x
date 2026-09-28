@@ -13,6 +13,7 @@ from typing import Mapping
 import torch
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import (
     FrozenMapping,
     MemoryRequirements,
@@ -97,6 +98,7 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
     return PcieQuery(surface=surface, world_size=int(runtime.world_size), rank=int(runtime.rank), topology="pcie_ipc", call=FrozenMapping(metadata), setup=setup)
 
 
+@program_cache(scope="preparation")
 def compile_dcp_surface(query_payload, ordinal):
     """Compile every eager/graph native variant represented by a declaration."""
     from . import _dcp_a2a_cute as cute

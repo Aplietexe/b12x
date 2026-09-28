@@ -8,6 +8,7 @@ later batch so each candidate is compared head to head with it.
 from __future__ import annotations
 
 import logging
+import gc
 import os
 import threading
 import time
@@ -21,6 +22,7 @@ from b12x._lib.compile_plan import (
     compiled_program_available, observe_programs, retain_compiled_programs,
 )
 from b12x._lib.compile_pool import CompilePool, describe_compilation, compile_in_process
+from b12x._lib.program_cache import PreparationProgramCache, evict_unretained
 from b12x._lib.runtime_control import KernelResolutionFrozenError, kernel_resolution_guard
 from ._cache import SelectionCache, cache_identity, digest
 from ._measurement import DEFAULT_SAMPLES, SURVIVOR_ROUNDS
@@ -488,18 +490,42 @@ class PreparationSession:
 
     def release(self, plan):
         """Drop a plan's prepared state; destroy graphs that replay it first."""
+        self.release_many((plan,))
+
+    def release_many(self, plans) -> None:
+        """Release a batch after graph teardown, then reclaim unused programs once."""
         self._check_thread()
         if self._job is not None:
             raise RuntimeError("cannot release resources during preparation")
-        prepared = plan._prepared
-        if prepared is None:
+        pending = {}
+
+        def collect(plan):
+            if plan in pending:
+                return
+            pending[plan] = plan._prepared
+            if isinstance(plan, _CompositePlan):
+                for child in plan.variants.values():
+                    collect(child)
+
+        for plan in plans:
+            collect(plan)
+        closers = [lambda plan=plan, prepared=prepared: self._release_payload(plan, prepared)
+                   for plan, prepared in pending.items() if prepared is not None]
+        if not closers:
             return
-        if isinstance(plan, _CompositePlan):
-            self._release_payload(plan, prepared)
-            for child in plan.variants.values():
-                self.release(child)
-        else:
-            self._release_payload(plan, prepared)
+        try:
+            _close_all((self._synchronize, *closers))
+        finally:
+            _close_all((self._reclaim_programs,))
+
+    def _reclaim_programs(self):
+        timing = PreparationTiming("cleanup", rank=self._tuning_rank)
+        keep = frozenset(program for plan in self._plans if plan.prepared is not None
+                         for program in plan.prepared.programs)
+        with timing.span("program_reclamation"):
+            removed = evict_unretained(keep)
+            gc.collect()
+        timing.record("complete", evicted_entries=removed)
 
     @contextmanager
     def capture(self):
@@ -523,6 +549,7 @@ class PreparationSession:
         if self.state == "CLOSED":
             return
         self._check_thread()
+        synchronize = bool(self._plans) or self._job is not None
         closers = []
         if self._job is not None:
             closers.append(self._job.close)
@@ -538,9 +565,12 @@ class PreparationSession:
             guard, self._guard = self._guard, None
             closers.append(lambda: guard.__exit__(None, None, None))
         self.state = "CLOSED"
-        _close_all(closers)
-        self._plans.clear()
-        self._shared.clear()
+        try:
+            _close_all(((self._synchronize,) if synchronize else ()) + tuple(closers))
+        finally:
+            self._plans.clear()
+            self._shared.clear()
+            _close_all((self._reclaim_programs,))
 
     def __enter__(self):
         self._check_thread()
@@ -575,6 +605,7 @@ class PreparationJob:
         self._plans_by_name = {}
         self._started = time.monotonic()
         self._timing = PreparationTiming("job", rank=session._tuning_rank)
+        self._program_cache = PreparationProgramCache(self._timing)
         self._last_advance_end = None
         self._phase = "planning"
         self._active_request = None
@@ -643,8 +674,11 @@ class PreparationJob:
         if self._last_advance_end is not None:
             self._timing.add("between_advances", started - self._last_advance_end)
         try:
-            return self._advance(collective_key=collective_key, tuning=tuning, cache=cache)
+            with self._program_cache.activate():
+                return self._advance(collective_key=collective_key, tuning=tuning, cache=cache)
         finally:
+            if self._result is not None or self._closed:
+                self._program_cache.clear()
             self._timing.add("advance", time.perf_counter() - started)
             self._timing.record(
                 "complete" if self._result is not None else "progress",
@@ -787,7 +821,12 @@ class PreparationJob:
             pool.cancel_optional()
             closers.append(lambda: pool.close(terminate=self._error is not None))
         self.session._job = None
-        _close_all(closers)
+        try:
+            _close_all(closers)
+        finally:
+            self._program_cache.clear()
+            if self._result is None:
+                _close_all((self.session._reclaim_programs,))
 
     def _choice_key(self, obligation, selections):
         request, configuration = obligation.request, obligation.configuration
@@ -1058,8 +1097,10 @@ class PreparationJob:
             # remain mutable during later serving warmup and graph replay.
             try:
                 with torch.inference_mode(False), torch.no_grad():
-                    state = request.plan._materialize(selection, self.session.device)
-                    call = factory(state)
+                    with self._timing.span("materialize"):
+                        state = request.plan._materialize(selection, self.session.device)
+                    with self._timing.span("bind"):
+                        call = factory(state)
                     guard = _CallGuard(call)
                     self._temporaries.append(guard.finish)
                 _prime(call)
@@ -1572,6 +1613,7 @@ class PreparationJob:
             for program in plan.prepared.programs
         )
         self.session._synchronize()
+        self._program_cache.clear()
         evict_unretained(keep)
         result = PreparationResult(
             plans=self._plans_by_name, coverage=self._coverage,

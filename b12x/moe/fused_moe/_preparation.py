@@ -11,6 +11,7 @@ from types import MappingProxyType
 import torch
 from b12x._lib.compile_plan import attach_programs, load_programs
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation.types import FrozenMapping, MemoryRequirements, Plan, _CompositePlan
 
 from ._impl import TPMoEScratchCaps, plan_b12x_fp4_moe_weights, plan_tp_moe_scratch
@@ -581,6 +582,7 @@ def _program_carriers(
     caps,
     w4a16_launches: _W4A16PrimaryLaunches | None = None,
     *,
+    compact_launches=None,
     input_scale_count: int,
     intermediate_scale_count: int,
 ):
@@ -598,7 +600,7 @@ def _program_carriers(
             (w4a16_launches or _w4a16_primary_launches(scratch, caps)).carriers()
         )
     elif plan.implementation == "micro":
-        compact = _compact_launches(plan, caps)
+        compact = compact_launches
         if compact is not None:
             launches.append(compact)
             return tuple(launches)
@@ -673,6 +675,17 @@ def _program_carriers(
             launches.append(launch)
     return tuple(launches)
 
+@dataclass(frozen=True)
+class _FusedMoePrograms:
+    fused_launches: tuple
+    topk_sum_launches: tuple
+    mixed_trellis_launches: tuple
+    w4a16: _W4A16PrimaryLaunches | None
+    compact: object | None
+    launchers: tuple
+
+
+@program_cache(scope="preparation")
 def compile_fused_moe(
     query_payload, config_payload, weight_payload, scale_counts, ordinal
 ):
@@ -684,14 +697,23 @@ def compile_fused_moe(
     weight_plan = plan_b12x_fp4_moe_weights(**weight_args)
     caps = _lower_caps(query, config, weight_plan, torch.device("cuda", ordinal))
     scratch = plan_tp_moe_scratch(caps, prewarm_launches=True)
+    w4a16 = (
+        _w4a16_primary_launches(scratch, caps)
+        if scratch.launch_plan.implementation == "w4a16" and not scratch.full_rotation
+        else None
+    )
+    compact = _compact_launches(scratch.launch_plan, caps)
+    launchers = _program_carriers(
+        scratch, caps, w4a16,
+        compact_launches=compact,
+        input_scale_count=int(scale_counts[0]), intermediate_scale_count=int(scale_counts[1]),
+    )
     return attach_programs(
-        scratch,
-        *_program_carriers(
-            scratch,
-            caps,
-            input_scale_count=int(scale_counts[0]),
-            intermediate_scale_count=int(scale_counts[1]),
+        _FusedMoePrograms(
+            scratch._prewarmed_fused_launches, scratch._prewarmed_topk_sum_launches,
+            scratch._mixed_trellis_launches, w4a16, compact, launchers,
         ),
+        *launchers, compact,
     )
 
 
@@ -848,20 +870,17 @@ def plan(experts: PreparedExperts, *, capacity: ExecutionCapacity, routing: Rout
             ).scratch_specs())
         def materialize(selection, device):
             caps = caps_for(selection.config, device)
-            scratch = plan_tp_moe_scratch(caps, prewarm_launches=True)
-            w4a16_launches = None
-            if (
-                scratch.launch_plan.implementation == "w4a16"
-                and not scratch.full_rotation
-            ):
-                w4a16_launches = _w4a16_primary_launches(scratch, caps)
-            launchers = list(_program_carriers(
-                scratch,
-                caps,
-                w4a16_launches,
-                input_scale_count=scale_counts[0],
-                intermediate_scale_count=scale_counts[1],
-            ))
+            programs = compile_fused_moe(
+                TUNING.encode_query(query), TUNING.encode_config(selection.config),
+                weight_payload, scale_counts, device.ordinal,
+            )
+            scratch = replace(
+                plan_tp_moe_scratch(caps, prewarm_launches=False),
+                _prewarmed_fused_launches=programs.fused_launches,
+                _prewarmed_topk_sum_launches=programs.topk_sum_launches,
+                _mixed_trellis_launches=programs.mixed_trellis_launches,
+            )
+            launchers = list(programs.launchers)
             route_query = _route_query_from_moe(query, routing)
             route_launcher = compile_route_topk(
                 ROUTE_TUNING.encode_query(route_query), device.ordinal
@@ -876,7 +895,7 @@ def plan(experts: PreparedExperts, *, capacity: ExecutionCapacity, routing: Rout
             load_programs(carrier_tree)
             return _FusedMoeState(
                 experts, scratch, selection.config, route_query,
-                launchers, route_launcher, w4a16_launches, _compact_launches(scratch.launch_plan, caps),
+                launchers, route_launcher, programs.w4a16, programs.compact,
             )
 
         return Plan(
@@ -935,6 +954,7 @@ def _dynamic_route_plan_payloads(plan, caps):
     )
 
 
+@program_cache(scope="preparation")
 def compile_dynamic_route_plan(payload, ordinal):
     """Compile the Triton route-plan program for one dynamic MoE launch."""
     from triton.runtime.jit import MockTensor
@@ -963,6 +983,7 @@ def compile_dynamic_route_plan(payload, ordinal):
         )
 
 
+@program_cache(scope="preparation")
 def compile_route_topk(query_payload, ordinal):
     """Compile the exact Triton route program from immutable ABI metadata."""
     import triton
@@ -1073,6 +1094,7 @@ def plan_route_topk(invocation: RouteTopKInvocation, *, override=None,
     )
 
 
+@program_cache(scope="preparation")
 def compile_fc2(query_payload, ordinal):
     """Resolve the exact standalone FC2 launcher retained by its prepared plan."""
     from ._tuning import MoeFC2Query

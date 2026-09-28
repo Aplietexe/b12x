@@ -10,6 +10,7 @@ import torch
 import triton
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x._lib.scratch import scratch_buffer_spec
 from b12x._lib.utils import current_cuda_stream, cuda_stream_to_int, make_ptr
 from b12x.preparation import FrozenMapping, MemoryRequirements, PersistentMemory, Plan
@@ -63,6 +64,7 @@ def _short_dense_lowering(query, config, device):
     return _lower_dense_with_hint(query, config, device, None)
 
 
+@program_cache(scope="preparation")
 def compile_packed(query_payload, config_payload, dense_payload, short_dense_payload,
                    ordinal, sm_count, capability):
     import cutlass
@@ -94,7 +96,7 @@ def compile_packed(query_payload, config_payload, dense_payload, short_dense_pay
             if slices > 1:
                 programs["reduce"] = _reduce.compile_reduce(query.out_features, slices, ordinal)
             return programs
-        programs = dense._compile_dense_lowering(dense_payload, ordinal)
+        programs = dict(dense._compile_dense_lowering(dense_payload, ordinal))
         if short_dense_payload is not None:
             programs.update({
                 "short_" + name: program
@@ -460,12 +462,13 @@ def _fixed_lowering(query, device):
     return _default_lowering(inner, device.identity), use_block
 
 
+@program_cache(scope="preparation")
 def compile_fixed(query_payload, lowering_payload, ordinal, sm_count):
     from b12x._lib import dense_gemm as dense
     from ._tuning import FixedBlockscaledQuery
     query = FixedBlockscaledQuery(**dict(query_payload))
     with torch.cuda.device(ordinal):
-        programs = dense._compile_dense_lowering(lowering_payload, ordinal)
+        programs = dict(dense._compile_dense_lowering(lowering_payload, ordinal))
         if query.call_kind == "packed" and query.recipe == "mxfp8" and query.input_dtype == "float16":
             from b12x._lib.quant import mxfp8_rows
             subgroup = 8 if query.expected_m <= 8 else mxfp8_rows._WARP_SUBGROUP_WIDTH
