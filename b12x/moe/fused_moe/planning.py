@@ -369,9 +369,11 @@ def prepare_weights(
             not isinstance(plan.source, PackedSource)
             or plan.source.format.value != "fp4_e8m0_k32"
             or plan.activation.mode is not ActivationMode.A16
-            or plan.prepared_format.packing is not WeightPacking.MMA_PACKED
+            or plan.prepared_format.packing not in {
+                WeightPacking.MMA_PACKED, WeightPacking.SOURCE_NATIVE
+            }
         ):
-            raise ValueError("X4T requires MXFP4 A16 with MMA-packed weight preparation")
+            raise ValueError("X4T requires native or MMA-packed MXFP4 A16 weights")
         prepared = prepare_b12x_x4t_weights(plan=plan._impl, weights=weights)
     elif isinstance(plan.source, PackedSource) and plan.source.format.value in BLOCK_CODECS:
         if not isinstance(weights, IQ2XSWeights) or weights.codec != plan.source.format.value:

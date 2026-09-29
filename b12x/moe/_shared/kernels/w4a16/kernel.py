@@ -12811,10 +12811,10 @@ def run_w4a16_moe(
         raise ValueError("prepared X4T weights have incomplete scale metadata")
     use_x4t_scale_predecode = x4t_w13_scale is not None
     if use_x4t_scale_predecode and (
-        weight_layout != "packed" or scale_format != "e8m0_k32"
+        weight_layout not in ("packed", "modelopt") or scale_format != "e8m0_k32"
     ):
         raise ValueError(
-            "X4T scale predecode requires packed FP4 weights with E8M0 K/32 scales"
+            "X4T scale predecode requires native or packed FP4 with E8M0 K/32 scales"
         )
     w13_layout = getattr(
         prepared,
@@ -13053,6 +13053,23 @@ def run_w4a16_moe(
             raise RuntimeError(
                 "W4A16 small-M direct path requires prepared micro scale metadata"
             )
+        if use_x4t_scale_predecode:
+            # Native and packed GEMMs consume the same expanded scale grid.
+            # The early-return micro path must refresh it before every launch.
+            from b12x._lib.quant.x4t_packed_scales import decode_x4t_packed_scales
+
+            programs = prepared.x4t_packed_programs
+            if programs is None or w13_layout != "w31":
+                raise ValueError("Native X4T requires prepared gate/up scale programs")
+            for i, (plane, target) in enumerate((
+                (x4t_w13_scale, micro_w13_scale),
+                (x4t_w2_scale, micro_w2_scale),
+            )):
+                decode_x4t_packed_scales(
+                    plane, topk_ids.view(-1), target,
+                    program=programs[i + (4 if topk_ids.dtype == torch.int64 else 0)],
+                    stream=stream,
+                )
         barrier_count = prepared.workspace[-2:-1]
         barrier_epoch = prepared.workspace[-1:]
         if _small_m_direct_host_barrier_reset_enabled():

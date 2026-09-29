@@ -23,7 +23,7 @@ from b12x._lib.utils import current_cuda_stream, make_ptr
 
 
 class _PackedScaleDecode:
-    def __init__(self, rows, columns, task_rows, rotation, clamp, unique, counts):
+    def __init__(self, rows, columns, task_rows, rotation, clamp, unique, counts, ids64):
         self.rows = int(rows)
         self.columns = int(columns)
         self.task_rows = int(task_rows)
@@ -95,7 +95,10 @@ class _PackedScaleDecode:
         block, _, _ = cute.arch.block_idx()
         slot = Int32(block) // Int32(self.tasks)
         task = Int32(block) % Int32(self.tasks)
-        expert = ids[slot].to(Int32)
+        raw_id = ids[slot].to(Int64)
+        expert = Int32(-1)
+        if raw_id >= Int64(0) and raw_id < Int64(experts):
+            expert = raw_id.to(Int32)
         if cutlass.const_expr(self.counts):
             expert = Int32(-1)
             if ids[slot].to(Int32) > Int32(0):
@@ -105,7 +108,7 @@ class _PackedScaleDecode:
             # have only one writer because exceptions follow the base stores.
             previous = Int32(0)
             while previous < slot and expert >= Int32(0):
-                if ids[previous].to(Int32) == expert:
+                if ids[previous].to(Int64) == Int64(expert):
                     expert = Int32(-1)
                 previous += Int32(1)
         if expert >= Int32(0) and expert < experts:
@@ -207,7 +210,7 @@ class _PackedScaleDecode:
 
 
 @functools.cache
-def _compiled_packed_scale(rows, columns, task_rows, rotation, clamp, unique, counts=False):
+def _compiled_packed_scale(rows, columns, task_rows, rotation, clamp, unique, counts=False, ids64=False):
     key = (
         int(rows),
         int(columns),
@@ -216,6 +219,7 @@ def _compiled_packed_scale(rows, columns, task_rows, rotation, clamp, unique, co
         bool(clamp),
         bool(unique),
         bool(counts),
+        bool(ids64),
     )
     launch = _PackedScaleDecode(*key)
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
@@ -224,13 +228,14 @@ def _compiled_packed_scale(rows, columns, task_rows, rotation, clamp, unique, co
         make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(cutlass.Int64, 8, cute.AddressSpace.gmem, assumed_align=8),
-        make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4),
+        make_ptr(cutlass.Int64 if ids64 else cutlass.Int32, 8 if ids64 else 4,
+                 cute.AddressSpace.gmem, assumed_align=8 if ids64 else 4),
         make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
         1,
         1,
         1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("quant.x4t_packed_scales", 2, key),
+        compile_spec=KernelCompileSpec.from_key("quant.x4t_packed_scales", 3, key),
     )
 
 
@@ -261,8 +266,8 @@ def decode_x4t_packed_scales(
     task_rows = batch.exception_task_rows
     if not task_rows or task_rows % 64 or batch.task_exception_offsets is None:
         raise ValueError("Packed X4T requires exception tasks aligned to 64 rows")
-    if expert_ids.dtype != torch.int32 or expert_ids.ndim != 1:
-        raise TypeError("Packed X4T expert_ids must be one-dimensional int32")
+    if expert_ids.dtype not in (torch.int32, torch.int64) or expert_ids.ndim != 1:
+        raise TypeError("Packed X4T expert_ids must be one-dimensional int32/int64")
     if expert_counts and expert_ids.numel() != batch.num_experts:
         raise ValueError("X4T route counts must contain one value per local expert")
     if output.dtype != torch.uint8 or tuple(output.shape) != (
@@ -286,6 +291,7 @@ def decode_x4t_packed_scales(
         clamp_e8m0_bf16,
         expert_ids_unique,
         expert_counts,
+        expert_ids.dtype == torch.int64,
     )
     compiled(
         make_ptr(
@@ -307,10 +313,10 @@ def decode_x4t_packed_scales(
             assumed_align=8,
         ),
         make_ptr(
-            cutlass.Int32,
+            cutlass.Int64 if expert_ids.dtype == torch.int64 else cutlass.Int32,
             expert_ids.data_ptr(),
             cute.AddressSpace.gmem,
-            assumed_align=4,
+            assumed_align=8 if expert_ids.dtype == torch.int64 else 4,
         ),
         make_ptr(
             cutlass.Uint8, output.data_ptr(), cute.AddressSpace.gmem, assumed_align=16

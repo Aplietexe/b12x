@@ -55,6 +55,7 @@ def _batch(rows, columns, rotation, task_rows=64):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize(
     "rows,columns,rotation",
     [
@@ -69,13 +70,14 @@ def _batch(rows, columns, rotation, task_rows=64):
     ],
 )
 def test_packed_scale_exact_boundaries_duplicates_and_dynamic_graph(
-    rows, columns, rotation
+    rows, columns, rotation, ids_dtype
 ):
     batch, logical = _batch(rows, columns, rotation)
     output = torch.full(
         (4, columns, rows), 0xD6, dtype=torch.uint8, device=logical.device
     )
-    ids = torch.tensor([3, 1, 3, -1, 4], dtype=torch.int32, device=logical.device)
+    invalid = 2**32 + 3 if ids_dtype == torch.int64 else 4
+    ids = torch.tensor([3, 1, 3, -1, invalid], dtype=ids_dtype, device=logical.device)
     decode_x4t_packed_scales(batch, ids, output)
     reference = _pack_e8m0_k32_scales(
         logical, size_k=columns * 32, size_n=rows, row_rotation=rotation
@@ -89,7 +91,7 @@ def test_packed_scale_exact_boundaries_duplicates_and_dynamic_graph(
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             decode_x4t_packed_scales(batch, ids, output)
-        ids.copy_(torch.tensor([2, 0, 2, -1, 7], dtype=torch.int32, device=ids.device))
+        ids.copy_(torch.tensor([2, 0, 2, -1, invalid], dtype=ids_dtype, device=ids.device))
         output.fill_(0xD6)
         allocated = torch.cuda.memory_allocated()
         graph.replay()
@@ -148,3 +150,36 @@ def test_packed_counts_retained_program_and_poisoned_graph():
                 else:
                     assert bool((output[expert] == 0xD6).all())
     graph.reset()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_native_x4t_keeps_nibbles_and_shares_micro_and_prefill_scales():
+    from b12x.moe import fused_moe
+
+    fc1, _ = _batch(1152, 160, 0)
+    fc2, _ = _batch(5120, 18, 0)
+    device = fc1.fixed.device
+    w13 = torch.zeros((4, 1152, 2560), dtype=torch.uint8, device=device)
+    w2 = torch.zeros((4, 5120, 288), dtype=torch.uint8, device=device)
+    scales13 = torch.empty((4, 160, 1152), dtype=torch.uint8, device=device)
+    scales2 = torch.empty((4, 18, 5120), dtype=torch.uint8, device=device)
+    plan = fused_moe.plan_weights(
+        source=fused_moe.PackedSource(format="fp4_e8m0_k32", w13_layout="w31"),
+        activation=fused_moe.ActivationSpec(
+            mode="a16", nonlinearity="silu", io_dtype=torch.bfloat16,
+            swiglu_limit=10.0,
+        ),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=4, hidden_size=5120, intermediate_size=576,
+        ),
+    )
+    experts = fused_moe.prepare_weights(plan=plan, weights=fused_moe.X4TWeights(
+        w13=w13, w2=w2, w13_scales=fc1, w2_scales=fc2,
+        w13_scale_scratch=scales13, w2_scale_scratch=scales2,
+    ))
+    assert experts.plan.prepared_format.packing.value == "source_native"
+    payload = experts._impl.representation.value
+    assert payload.w13 is w13 and payload.w2 is w2
+    assert payload.w13_scale.data_ptr() == payload.micro_w13_scale.data_ptr() == scales13.data_ptr()
+    assert payload.w2_scale.data_ptr() == payload.micro_w2_scale.data_ptr() == scales2.data_ptr()
+    assert len(payload.x4t_packed_programs) == 6
