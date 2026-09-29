@@ -35,7 +35,8 @@ def test_independent_matrices_keep_tp_codewords_and_scale_vectors(
 
     hidden, intermediate, experts = 128, 256, 2
     tensors, entries = {}, {}
-    filename = "trellis-layer-00.safetensors"
+    # Export shard ordinals need not equal the logical transformer layer.
+    filename = "trellis-layer-17.safetensors"
     for expert in range(experts):
         for matrix in ("w1", "w3", "w2"):
             n, k = (hidden, intermediate) if matrix == "w2" else (intermediate, hidden)

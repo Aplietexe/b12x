@@ -102,7 +102,13 @@ def read_independent_layer(
     )
     middle = torch.empty((num_experts, 3, local), dtype=torch.float16, device="cpu")
     outputs = torch.empty((num_experts, hidden_size), dtype=torch.float16, device="cpu")
-    filename = f"trellis-layer-{layer_index:02d}.safetensors"
+    first_name = f"layers.{layer_index}.ffn.experts.0.w1.weight"
+    first_entry = manifest["by_name"].get(first_name)
+    if first_entry is None:
+        raise ValueError(f"manifest has no independent expert layer {layer_index}")
+    filename = first_entry["packed_file"]
+    if Path(filename).name != filename or not filename.endswith(".safetensors"):
+        raise ValueError("packed_file must name a checkpoint-local safetensors file")
     with safe_open(root / filename, framework="pt", device="cpu") as handle:
         for expert in range(num_experts):
             for matrix, projection in enumerate(("w1", "w3", "w2")):
