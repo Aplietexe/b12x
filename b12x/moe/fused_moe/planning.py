@@ -306,7 +306,8 @@ def plan_weights(
         # geometries; container identity does not select an execution policy.
         tile_config = (
             (128, 128, 128, 128)
-            if expert.kind == "intermediate_hadamard" and bits == 2
+            if (expert.kind == "intermediate_hadamard" and bits == 2)
+            or (geometry.intermediate_size % 256 and geometry.intermediate_size % 128 == 0)
             else (128, 256, 64, 256)
             if config.codebook.value == "mcg" and source.uniform_bits is None
             else (64, 256, 64, 256)

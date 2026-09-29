@@ -6498,10 +6498,13 @@ class W4A16FusedMoeKernel:
                 raise ValueError(
                     "intermediate_rotation is only supported for trellis_t256"
                 )
-            if not is_gated or self.activation_is_swigluoai or self.has_swiglu_limit:
+            if not is_gated or self.activation_is_swigluoai:
                 raise ValueError(
-                    "intermediate_rotation requires unclamped gated silu or situ "
-                    "(no swiglu limit/oai)"
+                    "intermediate_rotation requires gated silu or situ (no oai)"
+                )
+            if self.has_swiglu_limit and intermediate_hadamard:
+                raise ValueError(
+                    "clamped trellis activation requires independent matrix transforms"
                 )
             if int(intermediate_size) % 128 != 0:
                 raise ValueError(
@@ -8110,6 +8113,11 @@ class W4A16FusedMoeKernel:
                 iu1 = uh1 * svu1
                 iu2 = uh2 * svu2
                 iu3 = uh3 * svu3
+                # Clamp in model coordinates, after undoing the output transform.
+                ig0, iu0 = self._clamp_swiglu_inputs(ig0, iu0)
+                ig1, iu1 = self._clamp_swiglu_inputs(ig1, iu1)
+                ig2, iu2 = self._clamp_swiglu_inputs(ig2, iu2)
+                ig3, iu3 = self._clamp_swiglu_inputs(ig3, iu3)
                 down = isz + isz
                 sd0 = rot_scales_flat[s_base + down + Int32(0)].to(cutlass.Float32)
                 sd1 = rot_scales_flat[s_base + down + Int32(1)].to(cutlass.Float32)
@@ -8525,6 +8533,10 @@ class W4A16FusedMoeKernel:
                 iu2_1 = uh1 * svu1
                 iu2_2 = uh2 * svu2
                 iu2_3 = uh3 * svu3
+                ig2_0, iu2_0 = self._clamp_swiglu_inputs(ig2_0, iu2_0)
+                ig2_1, iu2_1 = self._clamp_swiglu_inputs(ig2_1, iu2_1)
+                ig2_2, iu2_2 = self._clamp_swiglu_inputs(ig2_2, iu2_2)
+                ig2_3, iu2_3 = self._clamp_swiglu_inputs(ig2_3, iu2_3)
                 # silu(gate) * up, then pre-scale suh_down
                 d2 = isz + isz
                 sd0 = rot_scales_flat[s_base + d2 + Int32(0)].to(cutlass.Float32)

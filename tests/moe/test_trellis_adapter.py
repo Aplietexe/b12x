@@ -8,6 +8,7 @@ from dataclasses import replace
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from b12x.moe._shared.exl3_schema import Exl3Manifest
 from b12x.moe.checkpoints.exl3 import Exl3Layer, read_exl3_layer, trellis_from_exl3
@@ -24,6 +25,90 @@ from b12x.moe.fused_moe.trellis_layout import (
     append_intermediate_signs,
     assemble_uniform_slots,
 )
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_independent_matrices_keep_tp_codewords_and_scale_vectors(
+    tmp_path, monkeypatch, rank
+):
+    from b12x.moe.checkpoints import independent
+
+    hidden, intermediate, experts = 128, 256, 2
+    tensors, entries = {}, {}
+    filename = "trellis-layer-00.safetensors"
+    for expert in range(experts):
+        for matrix in ("w1", "w3", "w2"):
+            n, k = (hidden, intermediate) if matrix == "w2" else (intermediate, hidden)
+            stem = f"layers.0.ffn.experts.{expert}.{matrix}"
+            tensors[stem + ".trellis"] = torch.randint(
+                -32768, 32768, (k // 16, n // 16, 32), dtype=torch.int16
+            )
+            tensors[stem + ".suh"] = torch.randn(k).half()
+            tensors[stem + ".svh"] = torch.randn(n).half()
+            entries[stem + ".weight"] = {
+                "logical_shape": [n, k],
+                "packed_file": filename,
+            }
+    save_file(tensors, tmp_path / filename)
+    monkeypatch.setattr(independent, "_manifest", lambda root: {"by_name": entries})
+    source, weights = independent.read_independent_layer(
+        tmp_path,
+        0,
+        num_experts=experts,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        tp_rank=rank,
+        tp_size=2,
+    )
+    assert source.extent.first_slot == rank * 4
+    assert source.config.to_dict()["transform"]["expert"]["kind"] == "none"
+    planes = assemble_uniform_slots(
+        weights.codes, num_experts=experts, hidden_size=hidden, bits=2, device="cpu"
+    )
+    start, end = rank * 128, (rank + 1) * 128
+    for expert in range(experts):
+        for matrix, name in enumerate(("w1", "w3", "w2")):
+            stem = f"layers.0.ffn.experts.{expert}.{name}"
+            packed = tensors[stem + ".trellis"]
+            if matrix < 2:
+                assert torch.equal(
+                    planes[0][matrix, expert], packed[:, start // 16 : end // 16]
+                )
+                assert torch.equal(
+                    weights.input_scales.vectors[expert, matrix], tensors[stem + ".suh"]
+                )
+                assert torch.equal(
+                    weights.intermediate_scales.vectors[expert, matrix],
+                    tensors[stem + ".svh"][start:end],
+                )
+            else:
+                assert torch.equal(planes[1][expert], packed[start // 16 : end // 16])
+                assert torch.equal(
+                    weights.intermediate_scales.vectors[expert, matrix],
+                    tensors[stem + ".suh"][start:end],
+                )
+                assert torch.equal(
+                    weights.output_scales.vectors[expert], tensors[stem + ".svh"]
+                )
+
+
+@pytest.mark.parametrize(
+    "hidden,intermediate,tp", [(0, 256, 2), (128, 0, 2), (96, 256, 2), (128, 384, 2)]
+)
+def test_independent_tp_rejects_partial_hadamard_blocks(
+    tmp_path, hidden, intermediate, tp
+):
+    from b12x.moe.checkpoints.independent import read_independent_layer
+
+    with pytest.raises(ValueError, match="complete 128-channel"):
+        read_independent_layer(
+            tmp_path,
+            0,
+            num_experts=1,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            tp_size=tp,
+        )
 
 
 def _layer(*, first=48, slots=12, experts=3, bits=2, per_expert=True, hadamard=True):
