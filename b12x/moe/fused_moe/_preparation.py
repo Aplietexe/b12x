@@ -691,6 +691,7 @@ class _FusedMoePrograms:
     fused_launches: tuple
     topk_sum_launches: tuple
     mixed_trellis_launches: tuple
+    route_pack_launches: object | None
     w4a16: _W4A16PrimaryLaunches | None
     compact: object | None
     launchers: tuple
@@ -722,7 +723,8 @@ def compile_fused_moe(
     return attach_programs(
         _FusedMoePrograms(
             scratch._prewarmed_fused_launches, scratch._prewarmed_topk_sum_launches,
-            scratch._mixed_trellis_launches, w4a16, compact, launchers,
+            scratch._mixed_trellis_launches, scratch._prewarmed_route_pack_launches,
+            w4a16, compact, launchers,
         ),
         *launchers, compact,
     )
@@ -895,6 +897,7 @@ def plan(experts: PreparedExperts, *, capacity: ExecutionCapacity, routing: Rout
                 _prewarmed_fused_launches=programs.fused_launches,
                 _prewarmed_topk_sum_launches=programs.topk_sum_launches,
                 _mixed_trellis_launches=programs.mixed_trellis_launches,
+                _prewarmed_route_pack_launches=programs.route_pack_launches,
             )
             launchers = list(programs.launchers)
             route_query = _route_query_from_moe(query, routing)
