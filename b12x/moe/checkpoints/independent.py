@@ -48,7 +48,9 @@ def _manifest(root: str) -> dict:
         raise ValueError("independent trellis decoder table hash mismatch")
     with safe_open(tables_path, framework="pt", device="cpu") as handle:
         lut = handle.get_tensor("lut_e4m3_k2")
-        if not torch.equal(lut, lut_e4m3_direct_table_cpu()[:65536]):
+        with torch.device("cpu"):
+            reference_lut = lut_e4m3_direct_table_cpu()[:65536].cpu()
+        if not torch.equal(lut, reference_lut):
             raise ValueError("checkpoint K2 lookup differs from the B12X decoder")
         h = torch.ones((1, 1), dtype=torch.float64, device="cpu")
         while h.shape[0] < 128:
