@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import torch
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x._lib.scratch import scratch_buffer_spec
 from b12x.preparation import (
     FrozenMapping, MemoryRequirements, PersistentMemory, Plan,
@@ -71,6 +72,7 @@ def query_from_weight(
     )
 
 
+@program_cache(scope="preparation")
 def _compile_trellis(query_payload, config_payload, ordinal, sm_count):
     """Resolve exactly the native dense GEMM program selected by the session."""
     from b12x.moe._shared.kernels.w4a16.kernel import compile_w4a16_gemm
@@ -121,21 +123,21 @@ def _lut_memory(query: TrellisQuery, device) -> PersistentMemory | None:
     if query.codebook == "mcg":
         return None
     resolved = torch.device("cuda", device.ordinal)
-    if query.codebook == "sqg_e4m3":
-        from b12x._lib.quant.sqg_e4m3 import sqg_xor_cheb_t12_lut_resident
+    if query.codebook == "lut_e4m3":
+        from b12x._lib.quant.lut_e4m3 import lut_e4m3_value_table_resident
 
-        resident = sqg_xor_cheb_t12_lut_resident(resolved)
-        key = ("sqg_xor_cheb_t12_lut", resolved.type, resolved.index)
+        resident = lut_e4m3_value_table_resident(resolved)
+        key = ("lut_e4m3_value_table", resolved.type, resolved.index)
         required = 1 << 12
     else:
-        from b12x._lib.quant.sqg_fp16_d3l import (
-            SQG_FP16_D3L_DESCRIPTOR_BYTES,
-            sqg_fp16_d3l_descriptors_resident,
+        from b12x._lib.quant.lut_fp16 import (
+            LUT_FP16_SEGMENT_TABLE_BYTES,
+            lut_fp16_segment_table_resident,
         )
 
-        resident = sqg_fp16_d3l_descriptors_resident(resolved)
-        key = ("sqg_fp16_d3l_descriptors", resolved.type, resolved.index)
-        required = SQG_FP16_D3L_DESCRIPTOR_BYTES
+        resident = lut_fp16_segment_table_resident(resolved)
+        key = ("lut_fp16_segment_table", resolved.type, resolved.index)
+        required = LUT_FP16_SEGMENT_TABLE_BYTES
     resident_nbytes = (
         resident.numel() * resident.element_size() if resident is not None else 0
     )

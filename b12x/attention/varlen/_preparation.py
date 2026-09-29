@@ -7,6 +7,7 @@ import torch
 from b12x._lib.scratch import scratch_buffer_spec
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import (
     FrozenMapping, MemoryRequirements, PersistentMemory, Plan,
     current_plan, current_prepared_state,
@@ -50,6 +51,7 @@ def _varlen_payload(query_payload, invocation):
     ), contiguous
 
 
+@program_cache(scope="preparation")
 def compile_batched_attention(query_payload, invocation, config_payload, ordinal):
     query, values, contiguous = _batched_payload(query_payload, invocation)
     config = VarlenAttentionConfig.from_config(FrozenMapping(config_payload))
@@ -63,6 +65,7 @@ def compile_batched_attention(query_payload, invocation, config_payload, ordinal
         )
 
 
+@program_cache(scope="preparation")
 def compile_varlen_attention(query_payload, invocation, config_payload, ordinal):
     query, values, contiguous = _varlen_payload(query_payload, invocation)
     config = VarlenAttentionConfig.from_config(FrozenMapping(config_payload))
@@ -352,6 +355,13 @@ def plan_batched(q, k, v, *, causal=True, window_size=None, attention_sink_bias=
     )
 def plan(q, k, v, cu_seqlens_q, cu_seqlens_k=None, *, max_seqlen_q, max_seqlen_k,
          causal=False, window_size=None, attention_sink_bias=None, override=None):
+    """Prepare row and segment capacities for packed varlen attention.
+
+    Bindings may use fewer packed rows or segments than the planning tensors.
+    Head dimensions, dtype, and contiguous layouts remain fixed. GPU cumulative
+    lengths must describe the bound tensors; supplied maximum lengths must not
+    exceed the prepared limits. Live shapes never select or compile a program.
+    """
     query, invocation = _varlen_invocation(
         q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k, causal=causal, window_size=window_size,

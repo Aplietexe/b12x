@@ -9,6 +9,52 @@ from b12x.preparation import DeviceIdentity, FrozenMapping
 DEVICE = DeviceIdentity("nvidia", (12, 0), 188, "SM120")
 
 
+@pytest.mark.parametrize("mode", ("auto", "quantized", "a16"))
+@pytest.mark.parametrize("cutoff", (0, 32, 128, 256))
+def test_dense_a16_cutoff_constrains_candidates_and_covers_unlisted_counts(mode, cutoff):
+    from types import SimpleNamespace
+    import torch
+    from b12x.gemm.blockscaled import BlockscaledQuery, plan_regimes
+
+    query = BlockscaledQuery(
+        recipe="nvfp4", num_tokens=128, in_features=256, padded_in_features=256,
+        out_features=128, activation_mode=mode, activation_scale_available=True,
+    )
+    plan = plan_regimes(query, exact_m=(4, 64), a16_max_tokens=cutoff)
+    states = {}
+    for rows, child in plan.variants.items():
+        expected = "a16" if rows <= cutoff else mode
+        assert child.query.activation_mode == expected
+        candidates = child.contract.eligible_plan(child.query, DEVICE).candidates
+        assert candidates
+        if expected != "auto":
+            assert all(config.mode == expected for _, config in candidates)
+        states[rows] = SimpleNamespace(query=child.query, required_workspace=rows)
+    state = plan._assemble(states, None)
+    for rows in (1, 4, 17, 31, 32, 33, 64, 127, 128):
+        selected = state.resolve(torch.empty(rows, 256, device="meta"))
+        assert selected.query.activation_mode == ("a16" if rows <= cutoff else mode)
+        assert selected.query.num_tokens >= rows
+    assert state.required_workspace == 128
+
+
+@pytest.mark.parametrize("cutoff", (-1, 1.5, True))
+def test_a16_cutoff_rejects_invalid_values(cutoff):
+    import torch
+    from b12x.gemm.blockscaled import BlockscaledQuery, plan_regimes
+    from b12x.moe.fused_moe import ActivationMode, ActivationSpec
+
+    query = BlockscaledQuery(
+        recipe="nvfp4", num_tokens=128, in_features=256,
+        padded_in_features=256, out_features=128,
+    )
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        plan_regimes(query, a16_max_tokens=cutoff)
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        ActivationSpec(mode=ActivationMode.A4, nonlinearity="silu",
+                       io_dtype=torch.bfloat16, a16_max_tokens=cutoff)
+
+
 @pytest.mark.parametrize("rows", (1, 8, 128))
 def test_dense_nvfp4_auto_races_a4_and_a16(rows):
     from b12x.gemm.blockscaled._tuning import BlockscaledQuery, TUNING
@@ -35,6 +81,30 @@ def test_dense_nvfp4_without_activation_scale_excludes_a4():
         out_features=128, activation_mode="auto", activation_scale_available=False,
     )
     assert {config.mode for _, config in TUNING.eligible_plan(query, DEVICE).candidates} == {"a16"}
+
+
+@pytest.mark.parametrize("k,n", ((4096, 18560), (8192, 4096)))
+@pytest.mark.parametrize("rows", (1, 2, 4, 8, 16, 256))
+def test_super3_mamba_tuning_can_select_wide_k_without_changing_precision(k, n, rows):
+    from itertools import product
+
+    from b12x.gemm.blockscaled._tuning import BlockscaledQuery, TUNING
+
+    query = BlockscaledQuery(
+        recipe="nvfp4", num_tokens=rows, in_features=k, padded_in_features=k,
+        out_features=n, activation_mode="a16", activation_scale_available=False,
+        output_mode="functional", workspace_form="provided",
+        workspace_nbytes=2_000_000_000, expected_m=rows if rows <= 16 else None,
+    )
+    device = DeviceIdentity("nvidia", (12, 1), 48, "NVIDIA GB10")
+    configs = [config for _, config in TUNING.eligible_plan(query, device).candidates]
+    assert {config.mode for config in configs} == {"a16"}
+    # Every production decode tile/K-split combination must survive filtering;
+    # prefill additionally admits the larger row tiles supported by this path.
+    row_tiles = (16,) if rows <= 16 else (16, 32, 64)
+    assert {(c.tile_m, c.tile_n, c.tile_k, c.split_k) for c in configs} == set(
+        product(row_tiles, (64, 128), (64, 128, 256), (1, 2, 4, 8))
+    )
 
 
 def _nvfp4_query():

@@ -7,6 +7,7 @@ from types import MappingProxyType
 import torch
 
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, PersistentMemory, Plan
 from b12x.preparation.types import _CompositePlan
 from b12x.moe._shared.kernels.w4a16.host import select_route_block_size_m
@@ -45,10 +46,10 @@ def _weight_payload(experts: B12XFP4ExpertWeights) -> dict[str, object]:
         "num_experts": plan.num_experts, "hidden_size": plan.hidden_size,
         "intermediate_size": plan.intermediate_size, "w13_layout": plan.w13_layout,
         "w4a16_layout": plan.w4a16_weight_layout, "trellis_bits": plan.trellis_bits,
-        "trellis_tile_config": plan.trellis_tile_config, "coupled_hadamard": plan.coupled_hadamard,
+        "trellis_tile_config": plan.trellis_tile_config, "intermediate_hadamard": plan.intermediate_hadamard,
         "trellis_codebook": plan.trellis_codebook, "trellis_rate_granularity": plan.trellis_rate_granularity,
         "trellis_pair_kinds": None if plan.trellis_pair_kinds is None else tuple(plan.trellis_pair_kinds),
-        "coupled_hadamard_blocks": plan.coupled_hadamard_blocks,
+        "intermediate_hadamard_blocks": plan.intermediate_hadamard_blocks,
     }
 
 
@@ -80,7 +81,7 @@ def _compile_arguments(query: EpMoeQuery, invocation: FrozenMapping, weight_payl
             scale_format=getattr(prepared, "scale_format", "e4m3_k16"),
             w13_layout=getattr(prepared, "w13_layout", "w13"),
             trellis_bits=int(getattr(prepared, "trellis_bits", 3)),
-            trellis_codebook=str(getattr(prepared, "trellis_codebook", "sqg_e4m3")),
+            trellis_codebook=str(getattr(prepared, "trellis_codebook", "lut_e4m3")),
             fc1_trellis_pair_kind=getattr(prepared, "fc1_trellis_pair_kind", None),
             fc2_trellis_pair_kind=getattr(prepared, "fc2_trellis_pair_kind", None),
             direct_topk_routes=direct, use_expert_map=direct,
@@ -88,6 +89,7 @@ def _compile_arguments(query: EpMoeQuery, invocation: FrozenMapping, weight_payl
         )
 
 
+@program_cache(scope="preparation")
 def compile_ep_moe(query_payload, invocation_payload, weight_payload, ordinal):
     """Compile the real W4A16 EP route/GEMM/reduction launch from metadata only."""
     return _compile_arguments(EpMoeQuery(**dict(query_payload)), FrozenMapping(invocation_payload), weight_payload, ordinal)
@@ -226,8 +228,8 @@ def _weight_payload_placeholder(caps):
         "num_experts": caps.weight_plan.num_experts, "hidden_size": caps.weight_plan.hidden_size,
         "intermediate_size": caps.weight_plan.intermediate_size, "w13_layout": caps.weight_plan.w13_layout,
         "w4a16_layout": caps.weight_plan.w4a16_weight_layout, "trellis_bits": caps.weight_plan.trellis_bits,
-        "trellis_tile_config": caps.weight_plan.trellis_tile_config, "coupled_hadamard": caps.weight_plan.coupled_hadamard,
+        "trellis_tile_config": caps.weight_plan.trellis_tile_config, "intermediate_hadamard": caps.weight_plan.intermediate_hadamard,
         "trellis_codebook": caps.weight_plan.trellis_codebook, "trellis_rate_granularity": caps.weight_plan.trellis_rate_granularity,
         "trellis_pair_kinds": None if caps.weight_plan.trellis_pair_kinds is None else tuple(caps.weight_plan.trellis_pair_kinds),
-        "coupled_hadamard_blocks": caps.weight_plan.coupled_hadamard_blocks,
+        "intermediate_hadamard_blocks": caps.weight_plan.intermediate_hadamard_blocks,
     }

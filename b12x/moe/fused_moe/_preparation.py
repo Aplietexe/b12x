@@ -1,6 +1,8 @@
 """Preparation declarations for canonical fused tensor-parallel MoE."""
 from __future__ import annotations
 
+from b12x._lib.quant.block_codec import BLOCK_CODECS
+
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -9,11 +11,12 @@ from types import MappingProxyType
 import torch
 from b12x._lib.compile_plan import attach_programs, load_programs
 from b12x._lib.compile_pool import CompileJob
+from b12x._lib.program_cache import program_cache
 from b12x.preparation.types import FrozenMapping, MemoryRequirements, Plan, _CompositePlan
 
 from ._impl import TPMoEScratchCaps, plan_b12x_fp4_moe_weights, plan_tp_moe_scratch
 from ._tuning import FC2_TUNING, ROUTE_TUNING, MoeDecodeConfig, MoeDecodeQuery, TUNING
-from .planning import ActivationMode
+from .planning import ActivationMode, _packed_recipe
 from .weights import PreparedExperts
 from .execution import ExecutionCapacity, RoutingSpec
 
@@ -91,10 +94,14 @@ def _quant_mode(experts: PreparedExperts, config: MoeDecodeConfig) -> str:
 def _control_snapshot() -> FrozenMapping:
     """Capture host controls once while declaring the immutable query."""
     from . import _impl
+    from b12x.moe._shared.kernels.w4a16.host import (
+        prefill_fused_sum_enabled,
+    )
 
     tile = _impl._dynamic_tile_mn_override()
     raw_materialized = _impl.os.environ.get(_impl._DYNAMIC_NVFP4_MATERIALIZED_ENV)
     return FrozenMapping({
+        "w4a16_prefill_fused_sum": prefill_fused_sum_enabled(),
         "dynamic_nvfp4_materialized": (
             None if raw_materialized is None else raw_materialized not in ("", "0", "false", "False")
         ),
@@ -126,13 +133,21 @@ def _query(
     invocation: FrozenMapping,
 ) -> MoeDecodeQuery:
     plan = experts.plan._impl
+    quant_modes = tuple(sorted(plan.quant_modes))
+    quant_mode = (
+        "nvfp4_auto" if experts.plan.activation.mode is ActivationMode.AUTO
+        else (quant_modes[0] if len(quant_modes) == 1 else "multi")
+    )
+    cutoff = experts.plan.activation.a16_max_tokens
+    if cutoff:
+        if tokens <= cutoff:
+            quant_mode, quant_modes = "w4a16", ("w4a16",)
+        elif experts.plan.activation.mode is not ActivationMode.AUTO:
+            quant_mode = _packed_recipe(experts.plan.source, experts.plan.activation.mode)
+            quant_modes = (quant_mode,)
     return MoeDecodeQuery(
-        quant_mode=(
-            "nvfp4_auto"
-            if experts.plan.activation.mode is ActivationMode.AUTO
-            else (next(iter(plan.quant_modes)) if len(plan.quant_modes) == 1 else "multi")
-        ),
-        quant_modes=tuple(sorted(plan.quant_modes)),
+        quant_mode=quant_mode,
+        quant_modes=quant_modes,
         source_format=plan.source_format,
         activation=plan.activation,
         io_dtype=plan.io_dtype,
@@ -180,11 +195,11 @@ def _weight_payload(experts: PreparedExperts) -> dict[str, object]:
         ),
         "trellis_bits": plan.trellis_bits,
         "trellis_tile_config": plan.trellis_tile_config,
-        "coupled_hadamard": plan.coupled_hadamard,
+        "intermediate_hadamard": plan.intermediate_hadamard,
         "trellis_codebook": plan.trellis_codebook,
         "trellis_rate_granularity": plan.trellis_rate_granularity,
         "trellis_pair_kinds": None if plan.trellis_pair_kinds is None else tuple(plan.trellis_pair_kinds),
-        "coupled_hadamard_blocks": plan.coupled_hadamard_blocks,
+        "intermediate_hadamard_blocks": plan.intermediate_hadamard_blocks,
     }
 
 
@@ -240,8 +255,13 @@ def _lower_caps(
         deterministic_output=query.deterministic_output,
         swiglu_limit=_decode_scalar(query.swiglu_limit),
         swiglu_alpha=_decode_scalar(query.swiglu_alpha),
-        w4a16_block_size_m=query.w4a16_block_size_m,
+        w4a16_block_size_m=(config.w4a16_block_size_m
+                            if config.w4a16_block_size_m is not None
+                            else query.w4a16_block_size_m),
         w4a16_fast_math=query.fast_math,
+        w4a16_prefill_fused_sum=bool(
+            query.controls.get("w4a16_prefill_fused_sum", False)
+        ),
         swiglu_beta=_decode_scalar(query.swiglu_beta),
     )
 
@@ -350,7 +370,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
     tokens = int(scratch.launch_plan.max_tokens_per_launch)
     weight_layout = caps.w4a16_weight_layout or "packed"
     scale_format = caps.w4a16_scale_format or "e4m3_k16"
-    if weight_layout not in {"packed", "modelopt"}:
+    if weight_layout not in {"packed", "modelopt", "iq2_xs", "iq2_xxs", "q8_0"}:
         raise ValueError(f"unsupported standard W4A16 weight layout {weight_layout!r}")
     element_dtype = "bf16" if core.dtype == torch.bfloat16 else "fp16"
     w13_layout = caps.w13_layout if weight_layout == "modelopt" else "packed"
@@ -366,6 +386,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
         props = torch.cuda.get_device_properties(core.device)
         compiler_args = dict(
             size_m=tokens, hidden_size=core.k, intermediate_size=core.n,
+            direct_token_capacity=int(caps.max_tokens),
             num_experts=core.weight_E, top_k=core.num_topk,
             activation=core.activation,
             apply_router_weight_on_input=caps.apply_router_weight_on_input,
@@ -378,15 +399,32 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
             swiglu_limit=core.swiglu_limit, swiglu_alpha=core.swiglu_alpha,
             swiglu_beta=core.swiglu_beta, weight_layout=weight_layout,
             scale_format=scale_format, w13_layout=w13_layout,
+            force_tile_config=caps.decode_config.w4a16_tile_config,
+            pipeline_stages=caps.decode_config.w4a16_pipeline_stages,
         )
         packed = compile_w4a16_fused_moe(
             **compiler_args, zero_fc2_output=False, max_m_blocks=packed_blocks,
+            prefill_fused_sum_fp32=core.prefill_fused_sum_fp32,
         )
         packed_mapped = compile_w4a16_fused_moe(
             **compiler_args, zero_fc2_output=True, max_m_blocks=packed_blocks,
+            prefill_fused_sum_fp32=core.prefill_fused_sum_fp32,
         )
         direct = direct_mapped = None
-        if weight_layout == "packed":
+        if weight_layout in BLOCK_CODECS:
+            if (caps.decode_config.w4a16_route_mode != "packed"
+                    and tokens <= 8 and core.activation in {"silu", "relu2"} and not caps.deterministic_output
+                    and not caps.collect_activation_amax and not caps.apply_router_weight_on_input):
+                decode_args = {**compiler_args, "moe_block_size": 8}
+                direct = compile_w4a16_fused_moe(
+                    **decode_args, zero_fc2_output=False, max_m_blocks=tokens * core.num_topk,
+                    direct_topk_routes=True, tc_decode_fused_sum=True,
+                )
+                direct_mapped = compile_w4a16_fused_moe(
+                    **decode_args, zero_fc2_output=False, max_m_blocks=tokens * core.num_topk,
+                    direct_topk_routes=True, use_expert_map=True, tc_decode_fused_sum=True,
+                )
+        elif weight_layout == "packed":
             if tokens <= _MAX_DIRECT_TOPK_ROUTE_M:
                 direct = compile_w4a16_fused_moe(
                     **compiler_args, zero_fc2_output=False,
@@ -468,6 +506,7 @@ def _dynamic_program_arguments(plan, caps) -> dict[str, object]:
             planned_tile_m=tile_m,
             dynamic_route_mode="direct" if direct_routing else "grouped",
             deterministic_output=plan.deterministic_output,
+            w4a8_n64_repacked=n64_repacked,
         )
         and _impl._env_flag(
             _impl._DYNAMIC_EXTERNAL_ROUTE_PLAN_ENV,
@@ -551,6 +590,7 @@ def _program_carriers(
     caps,
     w4a16_launches: _W4A16PrimaryLaunches | None = None,
     *,
+    compact_launches=None,
     input_scale_count: int,
     intermediate_scale_count: int,
 ):
@@ -560,13 +600,15 @@ def _program_carriers(
     launches = [item[-1] for item in scratch._prewarmed_fused_launches]
     launches.extend(item[-1] for item in scratch._prewarmed_topk_sum_launches)
     launches.extend(item[-1] for item in scratch._mixed_trellis_launches)
+    if scratch._prewarmed_route_pack_launches is not None:
+        launches.extend(scratch._prewarmed_route_pack_launches.carriers())
     plan = scratch.launch_plan
     if plan.implementation == "w4a16" and not scratch.full_rotation:
         launches.extend(
             (w4a16_launches or _w4a16_primary_launches(scratch, caps)).carriers()
         )
     elif plan.implementation == "micro":
-        compact = _compact_launches(plan, caps)
+        compact = compact_launches
         if compact is not None:
             launches.append(compact)
             return tuple(launches)
@@ -615,7 +657,7 @@ def _program_carriers(
                         swiglu_beta=plan.swiglu_beta,
                         weight_layout=weight_layout,
                         trellis_bits=caps.weight_plan.trellis_bits or 0,
-                        trellis_coupled=caps.weight_plan.coupled_hadamard,
+                        trellis_intermediate_hadamard=caps.weight_plan.intermediate_hadamard,
                     )
                     launches.append(launch)
     elif plan.implementation == "dynamic":
@@ -635,12 +677,23 @@ def _program_carriers(
                 deterministic_output=plan.deterministic_output,
                 swiglu_limit=plan.swiglu_limit, swiglu_alpha=plan.swiglu_alpha,
                 swiglu_beta=plan.swiglu_beta, trellis_bits=caps.weight_plan.trellis_bits or 0,
-                trellis_coupled=caps.weight_plan.coupled_hadamard,
+                trellis_intermediate_hadamard=caps.weight_plan.intermediate_hadamard,
                 planned_tile_m=dynamic["planned_tile_m"],
             )
             launches.append(launch)
     return tuple(launches)
 
+@dataclass(frozen=True)
+class _FusedMoePrograms:
+    fused_launches: tuple
+    topk_sum_launches: tuple
+    mixed_trellis_launches: tuple
+    w4a16: _W4A16PrimaryLaunches | None
+    compact: object | None
+    launchers: tuple
+
+
+@program_cache(scope="preparation")
 def compile_fused_moe(
     query_payload, config_payload, weight_payload, scale_counts, ordinal
 ):
@@ -652,14 +705,23 @@ def compile_fused_moe(
     weight_plan = plan_b12x_fp4_moe_weights(**weight_args)
     caps = _lower_caps(query, config, weight_plan, torch.device("cuda", ordinal))
     scratch = plan_tp_moe_scratch(caps, prewarm_launches=True)
+    w4a16 = (
+        _w4a16_primary_launches(scratch, caps)
+        if scratch.launch_plan.implementation == "w4a16" and not scratch.full_rotation
+        else None
+    )
+    compact = _compact_launches(scratch.launch_plan, caps)
+    launchers = _program_carriers(
+        scratch, caps, w4a16,
+        compact_launches=compact,
+        input_scale_count=int(scale_counts[0]), intermediate_scale_count=int(scale_counts[1]),
+    )
     return attach_programs(
-        scratch,
-        *_program_carriers(
-            scratch,
-            caps,
-            input_scale_count=int(scale_counts[0]),
-            intermediate_scale_count=int(scale_counts[1]),
+        _FusedMoePrograms(
+            scratch._prewarmed_fused_launches, scratch._prewarmed_topk_sum_launches,
+            scratch._mixed_trellis_launches, w4a16, compact, launchers,
         ),
+        *launchers, compact,
     )
 
 
@@ -742,12 +804,16 @@ def variant_for(variants: Mapping[int, object], tokens: int):
 @dataclass(frozen=True)
 class _FusedMoeCapacityState:
     variants: MappingProxyType
+    a16_max_tokens: int = 0
 
     def bind(self, **kwargs):
         activations = kwargs.get("a")
         if not isinstance(activations, torch.Tensor) or activations.ndim != 2:
             raise TypeError("fused MoE binding requires a rank-two activation tensor")
-        return variant_for(self.variants, activations.shape[0]).bind(**kwargs)
+        tokens = activations.shape[0]
+        if 0 < tokens <= self.a16_max_tokens and tokens not in self.variants:
+            return self.variants[self.a16_max_tokens].bind(**kwargs)
+        return variant_for(self.variants, tokens).bind(**kwargs)
 
     def run(self, binding):
         return binding.run()
@@ -765,7 +831,8 @@ def plan(experts: PreparedExperts, *, capacity: ExecutionCapacity, routing: Rout
         raise TypeError("routing must be a RoutingSpec")
     invocation = FrozenMapping(invocation)
     controls = _control_snapshot()
-    counts = tuple(sorted({capacity.max_tokens, *capacity.warmup_token_counts}))
+    cutoff = min(experts.plan.activation.a16_max_tokens, capacity.max_tokens)
+    counts = tuple(sorted({capacity.max_tokens, *capacity.warmup_token_counts, *([cutoff] if cutoff else [])}))
     weight_payload = _weight_payload(experts)
     scale_counts = (
         int(experts._impl.a1_gscale.numel()),
@@ -816,20 +883,17 @@ def plan(experts: PreparedExperts, *, capacity: ExecutionCapacity, routing: Rout
             ).scratch_specs())
         def materialize(selection, device):
             caps = caps_for(selection.config, device)
-            scratch = plan_tp_moe_scratch(caps, prewarm_launches=True)
-            w4a16_launches = None
-            if (
-                scratch.launch_plan.implementation == "w4a16"
-                and not scratch.full_rotation
-            ):
-                w4a16_launches = _w4a16_primary_launches(scratch, caps)
-            launchers = list(_program_carriers(
-                scratch,
-                caps,
-                w4a16_launches,
-                input_scale_count=scale_counts[0],
-                intermediate_scale_count=scale_counts[1],
-            ))
+            programs = compile_fused_moe(
+                TUNING.encode_query(query), TUNING.encode_config(selection.config),
+                weight_payload, scale_counts, device.ordinal,
+            )
+            scratch = replace(
+                plan_tp_moe_scratch(caps, prewarm_launches=False),
+                _prewarmed_fused_launches=programs.fused_launches,
+                _prewarmed_topk_sum_launches=programs.topk_sum_launches,
+                _mixed_trellis_launches=programs.mixed_trellis_launches,
+            )
+            launchers = list(programs.launchers)
             route_query = _route_query_from_moe(query, routing)
             route_launcher = compile_route_topk(
                 ROUTE_TUNING.encode_query(route_query), device.ordinal
@@ -844,7 +908,7 @@ def plan(experts: PreparedExperts, *, capacity: ExecutionCapacity, routing: Rout
             load_programs(carrier_tree)
             return _FusedMoeState(
                 experts, scratch, selection.config, route_query,
-                launchers, route_launcher, w4a16_launches, _compact_launches(scratch.launch_plan, caps),
+                launchers, route_launcher, programs.w4a16, programs.compact,
             )
 
         return Plan(
@@ -862,13 +926,14 @@ def plan(experts: PreparedExperts, *, capacity: ExecutionCapacity, routing: Rout
         del device
         return _FusedMoeCapacityState(MappingProxyType({
             tokens: states[tokens] for tokens in counts
-        }))
+        }), a16_max_tokens=cutoff)
 
     return _CompositePlan(
         component_id="moe.decode",
         capacity_metadata=FrozenMapping({
             "token_counts": counts, "top_k": capacity.top_k,
             "controls": controls, "invocation": invocation,
+            **({"a16_max_tokens": cutoff} if cutoff else {}),
         }),
         variants=children, _assemble=assemble,
     )
@@ -903,6 +968,7 @@ def _dynamic_route_plan_payloads(plan, caps):
     )
 
 
+@program_cache(scope="preparation")
 def compile_dynamic_route_plan(payload, ordinal):
     """Compile the Triton route-plan program for one dynamic MoE launch."""
     from triton.runtime.jit import MockTensor
@@ -919,6 +985,8 @@ def compile_dynamic_route_plan(payload, ordinal):
             MockTensor(ids_dtype, (rows,)),
             MockTensor(torch.int32, (num_experts,)),
             MockTensor(torch.int32, (num_experts + 1,)),
+            MockTensor(torch.int32, (1,)),
+            MockTensor(torch.int32, (1,)),
             rows,
             NUM_EXPERTS=num_experts,
             TILE_M=tile_m,
@@ -929,6 +997,7 @@ def compile_dynamic_route_plan(payload, ordinal):
         )
 
 
+@program_cache(scope="preparation")
 def compile_route_topk(query_payload, ordinal):
     """Compile the exact Triton route program from immutable ABI metadata."""
     import triton
@@ -1039,6 +1108,7 @@ def plan_route_topk(invocation: RouteTopKInvocation, *, override=None,
     )
 
 
+@program_cache(scope="preparation")
 def compile_fc2(query_payload, ordinal):
     """Resolve the exact standalone FC2 launcher retained by its prepared plan."""
     from ._tuning import MoeFC2Query
@@ -1057,6 +1127,8 @@ def plan_fc2(experts: PreparedExperts, invocation: FC2Invocation, *, override=No
              declaration_invocation: FrozenMapping = FrozenMapping()) -> Plan:
     if not isinstance(experts, PreparedExperts):
         raise TypeError("FC2 preparation requires canonical PreparedExperts")
+    if experts.plan._impl.source_format in BLOCK_CODECS:
+        raise NotImplementedError("standalone IQ2_XS FC2 is unsupported; use fused MoE")
     if not isinstance(invocation, FC2Invocation):
         raise TypeError("FC2 preparation requires FC2Invocation")
     from ._tuning import MoeFC2Query
