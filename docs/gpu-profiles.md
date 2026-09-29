@@ -80,6 +80,15 @@ pins, fixed choices and partial races are never saved as measured winners.
 Malformed matching cache data fails closed. Compiler artifact availability is
 checked independently of selection-cache presence.
 
+vLLM divides each tuning race's candidates across TP ranks. At winner
+consolidation, it fetches missing CuTe objects and manifests from the rank
+that proposed the winning configuration before installing it locally.
+Transfers use 1 MiB CPU chunks on the preparation control channel, validate
+the object digest, and publish under the local compiler lock. A stalled peer
+falls back to local compilation and is not retried during that stage. Transfer
+threads and temporary store entries are released before preparation completes.
+Triton programs and fixed/default-only preparation retain local compilation.
+
 `B12X_COMPILE_WORKERS` limits compiler processes per preparation session
 (default: 4 on NVIDIA GB10/Spark, 8 elsewhere). An explicit `compile_workers`
 argument takes precedence. Lower this on unified-memory systems where compiler

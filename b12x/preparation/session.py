@@ -1388,6 +1388,11 @@ class PreparationJob:
                     obligation.key, self.session._tuning_ranks,
                     assignment, latency_us, candidate_index,
                     rejected_count=rejected_count,
+                    cute_programs=tuple(
+                        program.key for program in obligation.programs[
+                            request.plan.contract.config_payload(config)
+                        ] if program.dialect == "cute"
+                    ),
                 )
             selection = self._selection(obligation, config, "tuned", assignment)
             obligation.cache_pending = rejected_count == 0
