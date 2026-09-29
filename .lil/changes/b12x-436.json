@@ -1,0 +1,14 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "b12x-436",
+  "category": "performance",
+  "summary": "Use full-codeword lookup for eligible prepared K2 Trellis decode",
+  "models": ["Kimi-K3 EXL3"],
+  "compatibility": "No user action required.",
+  "details": [
+    "Eligible uniform K2 intermediate-Hadamard decode plans use an exact 64 KiB codeword table without changing decoded weight bytes or cooperative residency.",
+    "B12X_TRELLIS_DECODE_TABLE=compact retains the compact decoder for controlled comparisons."
+  ],
+  "pull_requests": [436],
+  "requires": []
+}
