@@ -23,7 +23,7 @@ from b12x._lib.utils import current_cuda_stream, make_ptr
 
 
 class _PackedScaleDecode:
-    def __init__(self, rows, columns, task_rows, rotation, clamp, unique):
+    def __init__(self, rows, columns, task_rows, rotation, clamp, unique, counts):
         self.rows = int(rows)
         self.columns = int(columns)
         self.task_rows = int(task_rows)
@@ -33,6 +33,7 @@ class _PackedScaleDecode:
         self.rotation = int(rotation)
         self.clamp = bool(clamp)
         self.unique = bool(unique)
+        self.counts = bool(counts)
         self.threads = 256
 
     @cute.jit
@@ -95,7 +96,11 @@ class _PackedScaleDecode:
         slot = Int32(block) // Int32(self.tasks)
         task = Int32(block) % Int32(self.tasks)
         expert = ids[slot].to(Int32)
-        if cutlass.const_expr(not self.unique):
+        if cutlass.const_expr(self.counts):
+            expert = Int32(-1)
+            if ids[slot].to(Int32) > Int32(0):
+                expert = slot
+        if cutlass.const_expr(not self.unique and not self.counts):
             # All threads resolve the same immutable list. Repeated IDs must
             # have only one writer because exceptions follow the base stores.
             previous = Int32(0)
@@ -202,7 +207,7 @@ class _PackedScaleDecode:
 
 
 @functools.cache
-def _compiled_packed_scale(rows, columns, task_rows, rotation, clamp, unique):
+def _compiled_packed_scale(rows, columns, task_rows, rotation, clamp, unique, counts=False):
     key = (
         int(rows),
         int(columns),
@@ -210,6 +215,7 @@ def _compiled_packed_scale(rows, columns, task_rows, rotation, clamp, unique):
         int(rotation),
         bool(clamp),
         bool(unique),
+        bool(counts),
     )
     launch = _PackedScaleDecode(*key)
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
@@ -224,7 +230,7 @@ def _compiled_packed_scale(rows, columns, task_rows, rotation, clamp, unique):
         1,
         1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("quant.x4t_packed_scales", 1, key),
+        compile_spec=KernelCompileSpec.from_key("quant.x4t_packed_scales", 2, key),
     )
 
 
@@ -235,6 +241,8 @@ def decode_x4t_packed_scales(
     *,
     clamp_e8m0_bf16: bool = True,
     expert_ids_unique: bool = False,
+    expert_counts: bool = False,
+    program=None,
     stream: cuda.CUstream | None = None,
 ) -> None:
     """Decode a scale plane in one allocation-free launch.
@@ -244,6 +252,10 @@ def decode_x4t_packed_scales(
     the caller asserts uniqueness. Exception partitions and row rotation are
     established by ``make_x4t_scale_batch`` at load time. Task rows must be
     multiples of 64 so packed-row permutations remain within CTA ownership.
+    With ``expert_counts=True``, the input is instead one routing count per
+    expert; positive entries select that expert without scanning route IDs.
+    ``program`` may retain the matching load-time compiled callable across
+    cache reclamation. Its geometry and mode must match the call arguments.
     """
     batch.validate()
     task_rows = batch.exception_task_rows
@@ -251,6 +263,8 @@ def decode_x4t_packed_scales(
         raise ValueError("Packed X4T requires exception tasks aligned to 64 rows")
     if expert_ids.dtype != torch.int32 or expert_ids.ndim != 1:
         raise TypeError("Packed X4T expert_ids must be one-dimensional int32")
+    if expert_counts and expert_ids.numel() != batch.num_experts:
+        raise ValueError("X4T route counts must contain one value per local expert")
     if output.dtype != torch.uint8 or tuple(output.shape) != (
         batch.num_experts,
         batch.columns,
@@ -264,13 +278,14 @@ def decode_x4t_packed_scales(
             )
     if not expert_ids.numel():
         return
-    compiled = _compiled_packed_scale(
+    compiled = program if program is not None else _compiled_packed_scale(
         batch.rows,
         batch.columns,
         task_rows,
         batch.exception_row_rotation,
         clamp_e8m0_bf16,
         expert_ids_unique,
+        expert_counts,
     )
     compiled(
         make_ptr(

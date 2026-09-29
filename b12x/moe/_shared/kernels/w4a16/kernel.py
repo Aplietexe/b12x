@@ -12870,6 +12870,8 @@ def run_w4a16_moe(
         raise ValueError("a_input, topk_weights, and topk_ids must be contiguous")
     _validate_expert_map(expert_map, device=a_input.device)
     _validate_expert_map(output_expert_map, device=a_input.device)
+    if getattr(prepared, "x4t_packed_programs", None) is not None and expert_map is not None:
+        raise NotImplementedError("DS4.1 packed X4T supports local TP expert IDs without expert mapping")
     if output_expert_map is not None and not full_rotation:
         raise ValueError("output_expert_map is only valid with full_rotation")
 
@@ -13290,19 +13292,34 @@ def run_w4a16_moe(
             packed_route_indices if use_direct_topk_routes else block_expert_ids
         )
         assert x4t_expert_ids is not None
-        decode_x4t_tp12_w4a16_scales(
-            x4t_w13_scale,
-            x4t_w2_scale,
-            x4t_expert_ids,
-            prepared.w13_scale,
-            prepared.w2_scale,
-            expert_map=expert_map if use_direct_topk_routes else None,
-            w13_row_rotation=int(
-                getattr(prepared, "x4t_w13_row_rotation", 0)
-            ),
-            expert_ids_unique=bool(use_direct_topk_routes and m == 1),
-            stream=stream,
-        )
+        programs = getattr(prepared, "x4t_packed_programs", None)
+        if programs is not None:
+            from b12x._lib.quant.x4t_packed_scales import decode_x4t_packed_scales
+
+            counts = not use_direct_topk_routes
+            active = expert_counts if counts else x4t_expert_ids
+            if active is None:
+                raise ValueError("Packed X4T routing requires caller-owned expert counts")
+            for plane_index, (plane, target) in enumerate((
+                (x4t_w13_scale, prepared.w13_scale),
+                (x4t_w2_scale, prepared.w2_scale),
+            )):
+                decode_x4t_packed_scales(
+                    plane, active, target, expert_counts=counts,
+                    program=programs[2 * int(counts) + plane_index], stream=stream,
+                )
+        else:
+            decode_x4t_tp12_w4a16_scales(
+                x4t_w13_scale,
+                x4t_w2_scale,
+                x4t_expert_ids,
+                prepared.w13_scale,
+                prepared.w2_scale,
+                expert_map=expert_map if use_direct_topk_routes else None,
+                w13_row_rotation=int(getattr(prepared, "x4t_w13_row_rotation", 0)),
+                expert_ids_unique=bool(use_direct_topk_routes and m == 1),
+                stream=stream,
+            )
 
     max_shared_mem = int(
         getattr(props, "shared_memory_per_block_optin", _DEFAULT_MAX_SHARED_MEM)

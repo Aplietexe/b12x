@@ -71,6 +71,7 @@ class W4A16PackedWeights:
     x4t_w13_scale: object | None = None
     x4t_w2_scale: object | None = None
     x4t_w13_row_rotation: int = 0
+    x4t_packed_programs: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -1368,22 +1369,18 @@ def prepare_w4a16_x4t_weights(
     hidden_size = shape.hidden_size
     intermediate_size = shape.intermediate_size
     w13_rows = shape.w13_rows
-    if (
-        hidden_size != 3584
-        or intermediate_size != 256
-        or w13_rows != 512
-        or not shape.is_gated
-    ):
+    kimi_tp12 = hidden_size == 3584 and intermediate_size == 256
+    ds41 = hidden_size == 5120 and intermediate_size in (2304, 1152, 576, 288)
+    if not shape.is_gated or not (kimi_tp12 or ds41):
         raise ValueError(
-            "initial X4T W4A16 execution supports only Kimi-K3's qualified "
-            "local geometry (H=3584, I=256, gated FC1)"
+            "X4T W4A16 requires gated Kimi TP12 or DS4.1 TP1/2/4/8 geometry"
         )
     if w13_x4t.num_experts != num_experts or w2_x4t.num_experts != num_experts:
         raise ValueError("X4T scale expert counts must match the weight tensors")
     if (w13_x4t.rows, w13_x4t.columns) != (w13_rows, hidden_size // 32):
-        raise ValueError("X4T FC1 scale geometry does not match Kimi-K3")
+        raise ValueError("X4T FC1 scale geometry does not match the weights")
     if (w2_x4t.rows, w2_x4t.columns) != (hidden_size, intermediate_size // 32):
-        raise ValueError("X4T FC2 scale geometry does not match Kimi-K3")
+        raise ValueError("X4T FC2 scale geometry does not match the weights")
     device = w13_fp4.device
     if w13_x4t.fixed.device != device or w2_x4t.fixed.device != device:
         raise ValueError("X4T scales and FP4 weights must share one CUDA device")
@@ -1415,6 +1412,26 @@ def prepare_w4a16_x4t_weights(
         "w2_scale_scratch", w2_scale_scratch, (intermediate_size // 32, hidden_size)
     )
     w13_row_rotation = intermediate_size if w13_layout == "w13" else 0
+    packed_programs = None
+    if ds41:
+        from b12x._lib.quant.x4t_packed_scales import _compiled_packed_scale
+
+        for plane, rotation in ((w13_x4t, w13_row_rotation), (w2_x4t, 0)):
+            if (
+                plane.exception_task_rows != 64
+                or plane.task_exception_offsets is None
+                or plane.exception_row_rotation != rotation
+            ):
+                raise ValueError("DS4.1 X4T requires rotation-aligned 64-row exception tasks")
+        # Retain both routing ABIs independently of compiler cache lifetime.
+        packed_programs = tuple(
+            _compiled_packed_scale(
+                plane.rows, plane.columns, 64, plane.exception_row_rotation,
+                True, False, counts,
+            )
+            for counts in (False, True)
+            for plane in (w13_x4t, w2_x4t)
+        )
     packed_w13 = _repack_weight(
         w13_fp4.contiguous(),
         size_k=hidden_size,
@@ -1446,6 +1463,7 @@ def prepare_w4a16_x4t_weights(
         x4t_w13_scale=w13_x4t,
         x4t_w2_scale=w2_x4t,
         x4t_w13_row_rotation=w13_row_rotation,
+        x4t_packed_programs=packed_programs,
     )
 
 

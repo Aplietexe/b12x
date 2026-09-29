@@ -121,3 +121,30 @@ def test_packed_scale_rejects_misaligned_exception_partition():
     output = torch.empty((4, 18, 128), dtype=torch.uint8, device=logical.device)
     with pytest.raises(ValueError, match="64 rows"):
         decode_x4t_packed_scales(batch, ids, output)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_packed_counts_retained_program_and_poisoned_graph():
+    batch, logical = _batch(1152, 160, 0)
+    output = torch.full((4, 160, 1152), 0xD6, dtype=torch.uint8, device=logical.device)
+    counts = torch.tensor([3, 0, 8, 0], dtype=torch.int32, device=logical.device)
+    program = _compiled_packed_scale(1152, 160, 64, 0, True, False, True)
+    reference = _pack_e8m0_k32_scales(logical, size_k=5120, size_n=1152).view(torch.uint8)
+    decode_x4t_packed_scales(batch, counts, output, expert_counts=True, program=program)
+    assert torch.equal(output[[0, 2]], reference[[0, 2]])
+    _compiled_packed_scale.cache_clear()
+    with kernel_resolution_guard("retained X4T counts decoder"):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            decode_x4t_packed_scales(batch, counts, output, expert_counts=True, program=program)
+        for active in ([0, 4, 0, 10], [0, 0, 0, 0], [1, 0, 4, 2]):
+            counts.copy_(torch.tensor(active, dtype=torch.int32, device=counts.device))
+            output.fill_(0xD6)
+            graph.replay()
+            torch.cuda.synchronize()
+            for expert, count in enumerate(active):
+                if count:
+                    assert torch.equal(output[expert], reference[expert])
+                else:
+                    assert bool((output[expert] == 0xD6).all())
+    graph.reset()
