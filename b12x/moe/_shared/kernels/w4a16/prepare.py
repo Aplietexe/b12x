@@ -71,7 +71,7 @@ class W4A16PackedWeights:
     x4t_w13_scale: object | None = None
     x4t_w2_scale: object | None = None
     x4t_w13_row_rotation: int = 0
-    x4t_packed_programs: tuple | None = None
+    x4t_packed_pair_programs: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -102,7 +102,7 @@ class W4A16ModelOptWeights:
     x4t_w13_scale: object | None = None
     x4t_w2_scale: object | None = None
     x4t_w13_row_rotation: int = 0
-    x4t_packed_programs: tuple | None = None
+    x4t_packed_pair_programs: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -1423,7 +1423,7 @@ def prepare_w4a16_x4t_weights(
     w13_row_rotation = intermediate_size if w13_layout == "w13" else 0
     packed_programs = None
     if ds41:
-        from b12x._lib.quant.x4t_packed_scales import _compiled_packed_scale
+        from b12x._lib.quant.x4t_packed_scales import _compiled_packed_scale_pair
 
         for plane, rotation in ((w13_x4t, w13_row_rotation), (w2_x4t, 0)):
             if (
@@ -1434,12 +1434,15 @@ def prepare_w4a16_x4t_weights(
                 raise ValueError("DS4.1 X4T requires rotation-aligned 64-row exception tasks")
         # Retain both routing ABIs independently of compiler cache lifetime.
         packed_programs = tuple(
-            _compiled_packed_scale(
-                plane.rows, plane.columns, 64, plane.exception_row_rotation,
-                True, False, counts, ids64,
+            _compiled_packed_scale_pair(*tuple(
+                (plane.rows, plane.columns, 64, plane.exception_row_rotation,
+                 True, False, counts, ids64, sorted_ids)
+                for plane in (w13_x4t, w2_x4t)
+            ))
+            for counts, ids64, sorted_ids in (
+                (False, False, False), (True, False, False),
+                (False, True, False), (False, False, True),
             )
-            for counts, ids64 in ((False, False), (True, False), (False, True))
-            for plane in (w13_x4t, w2_x4t)
         )
     if weight_layout == "modelopt":
         return W4A16ModelOptWeights(
@@ -1454,7 +1457,7 @@ def prepare_w4a16_x4t_weights(
             micro_w13_global_scale=w13_global_scale,
             micro_w2_global_scale=w2_global_scale, w13_layout=w13_layout,
             x4t_w13_scale=w13_x4t, x4t_w2_scale=w2_x4t,
-            x4t_packed_programs=packed_programs,
+            x4t_packed_pair_programs=packed_programs,
         )
     packed_w13 = _repack_weight(
         w13_fp4.contiguous(),
@@ -1487,7 +1490,7 @@ def prepare_w4a16_x4t_weights(
         x4t_w13_scale=w13_x4t,
         x4t_w2_scale=w2_x4t,
         x4t_w13_row_rotation=w13_row_rotation,
-        x4t_packed_programs=packed_programs,
+        x4t_packed_pair_programs=packed_programs,
     )
 
 
