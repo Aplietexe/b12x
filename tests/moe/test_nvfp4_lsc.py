@@ -1,0 +1,154 @@
+"""Compressed scales preserve native NVFP4 expert output under graph replay."""
+
+from dataclasses import replace
+
+import numpy as np
+import pytest
+import torch
+
+from b12x._lib.quant.nvfp4_lsc import make_nvfp4_lsc_batch
+from b12x.moe import fused_moe as moe
+from b12x.preparation import PreparationSession, PreparedCall
+from .test_nvfp4_phase_kernels import _build_domain
+from ..conftest import require_b12x
+
+
+def compress_fixture(swizzled, rows, columns):
+    """Build valid byte-window records independently from GPU expansion."""
+    e = swizzled.shape[0]
+    logical = swizzled.view(torch.uint8).reshape(e, rows // 128, columns // 4, 32, 4, 4)
+    logical = logical.permute(0, 1, 4, 3, 2, 5).contiguous().reshape(e, rows, columns)
+    fixed, exceptions = [], []
+    for source in logical.cpu().numpy():
+        base = np.minimum(source.min(axis=1), 240).astype(np.uint8)
+        offsets = source.astype(np.int16) - base[:, None]
+        outside = offsets > 15
+        offsets[outside] = 0
+        offsets = offsets.astype(np.uint8)
+        packed = offsets[:, ::2] | (offsets[:, 1::2] << 4)
+        fixed.append(
+            np.concatenate((base.reshape(-1, 16), packed.reshape(rows // 16, -1)), 1)
+        )
+        pos = np.flatnonzero(outside).astype(np.uint32)
+        exceptions.append(pos | (source.ravel()[pos].astype(np.uint32) << 24))
+    return make_nvfp4_lsc_batch(
+        fixed, exceptions, rows=rows, columns=columns, device=swizzled.device
+    )
+
+
+@pytest.mark.parametrize("tokens", [1, 17])
+def test_native_expert_output_and_shared_scratch_poisoned_replay(tokens):
+    device = require_b12x()
+    e, h, n, topk = 8, 256, 128, 2
+    domain = _build_domain(E=e, K=h, n=n, m=tokens, top_k=topk, seed=931)
+    weight_plan = moe.plan_weights(
+        source=moe.PackedSource(format="modelopt_nvfp4", w13_layout="w13"),
+        activation=moe.ActivationSpec(
+            mode="a4", nonlinearity="silu", io_dtype=torch.bfloat16, swiglu_limit=10.0
+        ),
+        geometry=moe.MoEGeometry(num_experts=e, hidden_size=h, intermediate_size=n),
+    )
+    s13 = domain["w13_sfb"].view(torch.float8_e4m3fn).view(e, 2 * n, h // 16)
+    s2 = domain["w2_sfb"].view(torch.float8_e4m3fn).view(e, h, n // 16)
+    one = torch.ones(e, device=device)
+    packed = moe.PackedWeights(
+        w13=domain["w13_packed"],
+        w2=domain["w2_packed"],
+        w13_block_scales=s13,
+        w2_block_scales=s2,
+        w13_global_scales=one,
+        w2_global_scales=one,
+        input_scale=one,
+        intermediate_scale=one,
+        immutable_input_scales=True,
+    )
+    buffers = (torch.empty_like(s13), torch.empty_like(s2))
+    compressed = moe.Nvfp4LscWeights(
+        packed=replace(packed, w13_block_scales=buffers[0], w2_block_scales=buffers[1]),
+        w13_scales=compress_fixture(s13, 2 * n, h // 16),
+        w2_scales=compress_fixture(s2, h, n // 16),
+    )
+    experts = [
+        moe.prepare_weights(plan=weight_plan, weights=w) for w in (packed, compressed)
+    ]
+    plans = [
+        moe.plan_execution(
+            experts=owner,
+            capacity=moe.ExecutionCapacity(max_tokens=tokens, top_k=topk),
+            invocation={"fast_math": False},
+            routing=moe.RoutingSpec(deterministic_output=True),
+        )
+        for owner in experts
+    ]
+    source, ids, probabilities = domain["x"], domain["topk_ids"], domain["topk_weights"]
+
+    def prepare(state):
+        scratch = tuple(
+            torch.empty(s.shape, dtype=s.dtype, device=device)
+            for s in state.scratch.scratch_specs()
+        )
+        output = torch.empty_like(source)
+        binding = state.bind(
+            a=source,
+            topk_ids=ids,
+            topk_weights=probabilities,
+            output=output,
+            scratch=scratch,
+            input_scales_static=True,
+        )
+        return PreparedCall(
+            run=lambda: state.run(binding), output=output, owners=(scratch, binding)
+        )
+
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=0
+    ) as session:
+        session.prepare(
+            tuple(
+                p.request(name=f"nvfp4-scale-storage-{i}", prepare_call=prepare)
+                for i, p in enumerate(plans)
+            )
+        )
+        owners, outputs, bindings, graphs = [], [], [], []
+        for plan in plans:
+            scratch = tuple(
+                torch.empty(s.shape, dtype=s.dtype, device=device)
+                for s in plan.scratch_specs()
+            )
+            output = torch.empty_like(source)
+            binding = moe.bind(
+                plan,
+                a=source,
+                topk_ids=ids,
+                topk_weights=probabilities,
+                output=output,
+                scratch=scratch,
+                input_scales_static=True,
+            )
+            owners.append(scratch)
+            outputs.append(output)
+            bindings.append(binding)
+        session.freeze()
+        for binding in bindings:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                moe.run(binding=binding)
+            graphs.append(graph)
+        for _ in range(3):
+            source.neg_()
+            ids.add_(1).remainder_(e)
+            for buffer in buffers:
+                buffer.view(torch.uint8).fill_(0x7F)
+            for output in outputs:
+                output.fill_(float("nan"))
+            allocated = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+            for graph in graphs:
+                graph.replay()
+            torch.cuda.synchronize()
+            assert (
+                torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocated
+            )
+            assert torch.isfinite(outputs[0]).all() and torch.count_nonzero(outputs[0])
+            torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
+        for graph in graphs:
+            graph.reset()

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from b12x._lib.quant.block_codec import BLOCK_CODECS
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 import torch
@@ -22,6 +22,7 @@ from .config import TrellisConfig
 from .source import PackedSource, TrellisSource, WeightSource
 from .trellis_layout import TrellisStaging
 from .weights import (
+    Nvfp4LscWeights,
     PackedWeights,
     X4TWeights,
     IQ2XSWeights,
@@ -353,7 +354,7 @@ def plan_weights(
 def prepare_weights(
     *,
     plan: WeightPlan,
-    weights: PackedWeights | TrellisWeights | IQ2XSWeights | X4TWeights,
+    weights: PackedWeights | TrellisWeights | IQ2XSWeights | X4TWeights | Nvfp4LscWeights,
     device: torch.device | str | None = None,
     staging: TrellisStaging | None = None,
 ) -> PreparedExperts:
@@ -363,6 +364,25 @@ def prepare_weights(
         raise TypeError("plan must be a WeightPlan")
     if (device is not None or staging is not None) and not isinstance(plan.source, TrellisSource):
         raise ValueError("device and staging are only supported for trellis preparation")
+    if isinstance(weights, Nvfp4LscWeights):
+        from b12x._lib.quant.nvfp4_lsc import Nvfp4LscDecoder
+
+        if (
+            not isinstance(plan.source, PackedSource)
+            or plan.source.format.value != "modelopt_nvfp4"
+            or plan.source.w13_layout.value != "w13"
+            or plan.activation.mode is not ActivationMode.A4
+            or plan.activation.a16_max_tokens
+        ):
+            raise ValueError("NVFP4-LSC requires native ModelOpt NVFP4 A4 in up/gate order")
+        prepared = prepare_weights(plan=plan, weights=weights.packed)
+        decoder = Nvfp4LscDecoder.prepare(
+            weights.w13_scales, weights.w2_scales,
+            prepared._impl.w1_blockscale, prepared._impl.w2_blockscale,
+        )
+        return PreparedExperts(
+            plan=plan, _impl=replace(prepared._impl, nvfp4_lsc=decoder)
+        )
     if isinstance(weights, X4TWeights):
         if (
             not isinstance(plan.source, PackedSource)
