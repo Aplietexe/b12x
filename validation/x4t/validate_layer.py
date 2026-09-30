@@ -12,7 +12,7 @@ from safetensors import safe_open
 from b12x._lib.quant.x4t_packed_scales import decode_x4t_packed_scales
 from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.moe import fused_moe
-from b12x.moe.checkpoints.exact_mxfp4 import read_exact_mxfp4_layer
+from b12x.moe.checkpoints.exact_mxfp4 import checkpoint_contract, read_exact_mxfp4_layer
 from tests._reference.helpers import make_tp_moe_fp4_binding
 
 
@@ -57,7 +57,10 @@ def main():
     args = parser.parse_args()
     torch.set_num_threads(4)
     torch.manual_seed(2047)
-    e, h, n = 384, 5120, 2304 // args.tp
+    family = checkpoint_contract(str(args.checkpoint.resolve()))["family"]
+    kimi = family == "kimi_k3"
+    e, h, intermediate, topk = (896, 3584, 3072, 16) if kimi else (384, 5120, 2304, 6)
+    n = intermediate // args.tp
     device = torch.device("cuda:0")
     scratch = (
         torch.empty((e, h // 32, 2 * n), dtype=torch.uint8, device=device),
@@ -68,7 +71,7 @@ def main():
         args.layer,
         num_experts=e,
         hidden_size=h,
-        intermediate_size=2304,
+        intermediate_size=intermediate,
         tp_rank=args.rank,
         tp_size=args.tp,
         device=device,
@@ -87,8 +90,14 @@ def main():
         handles = {}
         for expert in range(e):
             for i, projection in enumerate(("w1", "w3", "w2")):
-                stem = f"layers.{args.layer}.ffn.experts.{expert}.{projection}"
-                for suffix in (".scale", ".weight"):
+                stem = (
+                    f"language_model.model.layers.{args.layer}.block_sparse_moe."
+                    f"experts.{expert}.{projection}"
+                    if kimi else f"layers.{args.layer}.ffn.experts.{expert}.{projection}"
+                )
+                scale_suffix = ".weight_scale" if kimi else ".scale"
+                weight_suffix = ".weight_packed" if kimi else ".weight"
+                for suffix in (scale_suffix, weight_suffix):
                     name = stem + suffix
                     filename = index[name]
                     if filename not in handles:
@@ -98,23 +107,24 @@ def main():
                     value = handles[filename].get_tensor(name).view(torch.uint8)
                     if i < 2:
                         value = value[first:last]
-                        if suffix == ".scale":
+                        if suffix == scale_suffix:
                             scales13[expert, i * n : (i + 1) * n].copy_(value)
                         else:
                             assert torch.equal(
                                 value, weights.w13[expert, i * n : (i + 1) * n].cpu()
                             )
                     else:
-                        divisor = 32 if suffix == ".scale" else 2
+                        divisor = 32 if suffix == scale_suffix else 2
                         value = value[:, first // divisor : last // divisor]
-                        if suffix == ".scale":
+                        if suffix == scale_suffix:
                             scales2[expert].copy_(value)
                         else:
                             assert torch.equal(value, weights.w2[expert].cpu())
     plan_args = dict(
         source=fused_moe.PackedSource(format="fp4_e8m0_k32", w13_layout="w31"),
         activation=fused_moe.ActivationSpec(
-            mode="a16", nonlinearity="silu", io_dtype=torch.bfloat16, swiglu_limit=10.0
+            mode="a16", nonlinearity="situ" if kimi else "silu",
+            io_dtype=torch.bfloat16, swiglu_limit=None if kimi else 10.0
         ),
         geometry=fused_moe.MoEGeometry(
             num_experts=e, hidden_size=h, intermediate_size=n
@@ -161,9 +171,9 @@ def main():
     for tokens in map(int, args.tokens.split(",")):
         x = torch.randn((tokens, h), dtype=torch.bfloat16, device=device) * 0.5
         ids = torch.randint(
-            e, (tokens, 6), dtype=getattr(torch, args.routing_dtype), device=device
+            e, (tokens, topk), dtype=getattr(torch, args.routing_dtype), device=device
         )
-        route_weights = torch.softmax(torch.randn(tokens, 6, device=device), -1)
+        route_weights = torch.softmax(torch.randn(tokens, topk, device=device), -1)
         with ExitStack() as stack:
             bindings = [
                 stack.enter_context(
@@ -237,6 +247,7 @@ def main():
                 "graph_mutations": args.graph_mutations,
                 "routing_dtype": args.routing_dtype,
                 "layer": args.layer,
+                "family": family,
                 "tp": args.tp,
                 "rank": args.rank,
                 "native_packing": native_plan.prepared_format.packing.value,

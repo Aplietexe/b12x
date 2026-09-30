@@ -1374,16 +1374,16 @@ def prepare_w4a16_x4t_weights(
     hidden_size = shape.hidden_size
     intermediate_size = shape.intermediate_size
     w13_rows = shape.w13_rows
-    kimi_tp12 = hidden_size == 3584 and intermediate_size == 256
+    kimi = hidden_size == 3584 and intermediate_size in (3072, 1536, 768, 384, 256, 192)
     ds41 = hidden_size == 5120 and intermediate_size in (2304, 1152, 576, 288)
-    if not shape.is_gated or not (kimi_tp12 or ds41):
+    if not shape.is_gated or not (kimi or ds41):
         raise ValueError(
-            "X4T W4A16 requires gated Kimi TP12 or DS4.1 TP1/2/4/8 geometry"
+            "X4T W4A16 requires gated Kimi TP1/2/4/8/12/16 or DS4.1 TP1/2/4/8 geometry"
         )
     if weight_layout not in ("packed", "modelopt"):
         raise ValueError("X4T requires packed or native FP4 weight storage")
-    if weight_layout == "modelopt" and (not ds41 or w13_layout != "w31"):
-        raise ValueError("Native X4T requires DS4.1 gate/up source order")
+    if weight_layout == "modelopt" and w13_layout != "w31":
+        raise ValueError("Native X4T requires gate/up source order")
     if w13_x4t.num_experts != num_experts or w2_x4t.num_experts != num_experts:
         raise ValueError("X4T scale expert counts must match the weight tensors")
     if (w13_x4t.rows, w13_x4t.columns) != (w13_rows, hidden_size // 32):
@@ -1422,7 +1422,9 @@ def prepare_w4a16_x4t_weights(
     )
     w13_row_rotation = intermediate_size if w13_layout == "w13" else 0
     packed_programs = None
-    if ds41:
+    if ds41 or (
+        w13_x4t.exception_task_rows == 64 and w2_x4t.exception_task_rows == 64
+    ):
         from b12x._lib.quant.x4t_packed_scales import _compiled_packed_scale_pair
 
         for plane, rotation in ((w13_x4t, w13_row_rotation), (w2_x4t, 0)):
@@ -1431,7 +1433,7 @@ def prepare_w4a16_x4t_weights(
                 or plane.task_exception_offsets is None
                 or plane.exception_row_rotation != rotation
             ):
-                raise ValueError("DS4.1 X4T requires rotation-aligned 64-row exception tasks")
+                raise ValueError("Paired X4T requires rotation-aligned 64-row exception tasks")
         # Retain both routing ABIs independently of compiler cache lifetime.
         packed_programs = tuple(
             _compiled_packed_scale_pair(*tuple(
