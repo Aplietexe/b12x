@@ -318,8 +318,9 @@ def test_mm_mxfp8_grouped_batches_use_their_own_scales() -> None:
         expected_m=2048, sfb_k_replicated=True, _tile_k_override=64,
     ) as plan:
         out = blockscaled.mm(lhs, rhs, plan=plan)
-    a_deq = dequantize_mxfp8_rows_torch(a_q.values, a_q.scale_rows).to(torch.bfloat16)
-    b_deq = dequantize_mxfp8_rows_torch(b_q.values, b_q.scale_rows).to(torch.bfloat16)
+    # Accumulate in FP64 so FP32 rounding cannot cross a BF16 midpoint.
+    a_deq = dequantize_mxfp8_rows_torch(a_q.values, a_q.scale_rows).to(torch.float64)
+    b_deq = dequantize_mxfp8_rows_torch(b_q.values, b_q.scale_rows).to(torch.float64)
     ref = torch.einsum("mkl,nkl->mnl", a_deq, b_deq).to(torch.bfloat16)
 
     torch.testing.assert_close(out, ref, rtol=0, atol=0)
