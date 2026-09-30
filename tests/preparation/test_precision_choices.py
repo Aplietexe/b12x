@@ -84,19 +84,44 @@ def test_dense_nvfp4_without_activation_scale_excludes_a4():
 
 
 @pytest.mark.parametrize("recipe", ("nvfp4", "iq2_xs", "iq2_xxs", "q8_0"))
-@pytest.mark.parametrize("sm_count", (48, 188))
-@pytest.mark.parametrize("rows,k,n", ((1, 512, 768), (2, 2048, 640), (16, 3072, 1536), (256, 2048, 768)))
-def test_dense_heuristic_respects_zero_split_workspace(recipe, sm_count, rows, k, n):
+@pytest.mark.parametrize("capability,sm_count", (((12, 1), 48), ((12, 0), 188)))
+@pytest.mark.parametrize("rows,k,n", ((1, 512, 768), (2, 2048, 640), (16, 3072, 1536), (256, 2048, 768), (1, 4096, 24576), (16, 8192, 12288)))
+@pytest.mark.parametrize("workspace_nbytes", (0, 65536))
+def test_dense_heuristic_respects_split_workspace_budget(recipe, capability, sm_count, rows, k, n, workspace_nbytes):
     from b12x.gemm.blockscaled._tuning import BlockscaledQuery, TUNING
 
     query = BlockscaledQuery(
         recipe=recipe, num_tokens=rows, in_features=k, padded_in_features=k,
         out_features=n, activation_mode="a16", workspace_form="provided",
-        workspace_nbytes=0,
+        workspace_nbytes=workspace_nbytes,
     )
-    device = DeviceIdentity("nvidia", (12, 0), sm_count, "test device")
+    device = DeviceIdentity("nvidia", capability, sm_count, "test device")
     selected = TUNING.configure(query, device=device, search=False).default
-    assert selected.split_k == 1
+    required = selected.split_k * rows * n * 4 if selected.split_k > 1 else 0
+    assert required <= workspace_nbytes
+
+
+@pytest.mark.parametrize("capability,sms,spark", (
+    ((12, 0), 188, False), ((12, 0), 48, False),
+    ((12, 1), 96, False), ((12, 1), 48, True),
+))
+@pytest.mark.parametrize("recipe,rows,k,n,general,gb10", (
+    ("iq2_xxs", 2, 4096, 6144, (2, 4, 256, 1), (8, 128, 256, 1)),
+    ("iq2_xs", 256, 6144, 4096, (16, 128, 256, 1), (32, 64, 64, 1)),
+    ("q8_0", 1, 4096, 256, (16, 64, 64, 8), (16, 128, 64, 4)),
+    ("q8_0", 4, 4096, 320, (1, 4, 256, 1), (2, 4, 256, 1)),
+))
+def test_dense_spark_defaults_preserve_other_devices(capability, sms, spark, recipe, rows, k, n, general, gb10):
+    from b12x.gemm.blockscaled._tuning import BlockscaledConfig, BlockscaledQuery, TUNING
+
+    query = BlockscaledQuery(
+        recipe=recipe, num_tokens=rows, in_features=k, padded_in_features=k,
+        out_features=n, activation_mode="a16",
+    )
+    device = DeviceIdentity("nvidia", capability, sms, "synthetic GPU")
+    m, n_tile, k_tile, split = gb10 if spark else general
+    expected = BlockscaledConfig(mode="a16", tile_m=m, tile_n=n_tile, tile_k=k_tile, split_k=split)
+    assert TUNING.configure(query, device=device, search=False).default == expected
 
 
 @pytest.mark.parametrize("k,n", ((4096, 18560), (8192, 4096)))

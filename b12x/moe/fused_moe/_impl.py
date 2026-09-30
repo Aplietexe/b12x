@@ -2717,6 +2717,30 @@ def _heuristic_moe_decode_config(
             )
         return _heuristic_moe_decode_config(replace(query, quant_mode="nvfp4"), device)
     if query.quant_mode == "w4a16":
+        if (
+            query.source_format in ("iq2_xs", "iq2_xxs")
+            and device is not None
+            and device.compute_capability == (12, 1)
+            and device.sm_count == 48
+            and query.routed_rows >= 8 * device.sm_count
+            and query.num_tokens > 16
+            and query.hidden_size % 256 == 0
+            and query.intermediate_size % 256 == 0
+        ):
+            # Full route blocks amortize decoding; sparse experts retain M8's
+            # extra resident CTA. Only planned capacity enters this choice.
+            experts = query.route_num_experts or query.num_experts
+            block = query.w4a16_block_size_m or next(
+                (b for b in (8, 16, 32, 48, 64)
+                 if query.routed_rows <= b * experts), 64,
+            )
+            return MoeDecodeConfig(
+                backend="w4a16", route_planner="internal",
+                max_active_clusters=None, w4a16_route_mode="packed",
+                w4a16_tile_config=(128, 128, 128, 128) if block == 8 else (64, 256, 64, 256),
+                w4a16_block_size_m=block,
+                w4a16_pipeline_stages=2 if block == 8 else 4,
+            )
         return MoeDecodeConfig(
             backend="w4a16",
             route_planner="internal",

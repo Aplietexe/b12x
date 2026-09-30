@@ -106,3 +106,25 @@ def test_q8_large_tiles_reject_excess_shared_memory_before_compilation():
     )
     with pytest.raises(ValueError, match="shared-memory"):
         TUNING.configure(query("q8_0"), device=DEVICE, override=c)
+
+
+@pytest.mark.parametrize("capability,sms,spark", (
+    ((12, 0), 188, False), ((12, 0), 48, False),
+    ((12, 1), 96, False), ((12, 1), 48, True),
+))
+@pytest.mark.parametrize("codec", ("iq2_xs", "iq2_xxs", "q8_0"))
+@pytest.mark.parametrize("experts,block,tiles,stages", (
+    (256, 16, (64, 256, 64, 256), 4),
+    (320, 8, (128, 128, 128, 128), 2),
+))
+def test_spark_prefill_defaults_preserve_other_devices(capability, sms, spark, codec, experts, block, tiles, stages):
+    q = replace(query(codec), num_experts=experts, route_num_experts=experts)
+    device = DeviceIdentity("nvidia", capability, sms, "synthetic GPU")
+    expected = MoeDecodeConfig(
+        backend="w4a16", route_planner="internal", max_active_clusters=None,
+        w4a16_route_mode="packed",
+    )
+    if spark and codec != "q8_0":
+        expected = replace(expected, w4a16_tile_config=tiles,
+                           w4a16_block_size_m=block, w4a16_pipeline_stages=stages)
+    assert TUNING.configure(q, device=device, search=False).default == expected

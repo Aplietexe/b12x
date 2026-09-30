@@ -29,6 +29,7 @@ from .test_iq2_xs import blocks
         ("relu2", True, "direct", 6, (1, 3, 6)),
         ("relu2", False, "direct", 8, (1, 3, 8)),
         ("relu2", True, "direct", 8, (1, 3, 8)),
+        ("relu2", False, "heuristic", 256, (1, 17, 256)),
     ],
 )
 @pytest.mark.parametrize("codec", ["iq2_xs", "iq2_xxs", "q8_0"])
@@ -63,6 +64,8 @@ def test_prepared_execution(
             patterns=("balanced", "hot"),
             repeats=1,
             launches=1,
+            # No override for the heuristic; the session disables search.
+            autotune=route == "heuristic",
         )
     assert len(results) == len(counts) * 2
 

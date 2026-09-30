@@ -107,6 +107,11 @@ def _default_config(query, device):
 
 
 def _a16_default_config(query, device):
+    if (
+        device is not None
+        and device.compute_capability == (12, 1) and device.sm_count == 48
+    ):
+        return _gb10_a16_default_config(query, device)
     if query.recipe == "mxfp8" or device is None:
         if _automatic_a16(query, device):
             return BlockscaledConfig(mode="a16", tile_n=128, tile_k=64, split_k=4)
@@ -147,6 +152,89 @@ def _a16_default_config(query, device):
                 splits.append(split)
     # Extra partitions must offset their partial-output and reduction overhead.
     reduction_penalty = 0.005 if iq2 else 0.025
+    split_k = min(splits, key=lambda split: (
+        ((grid * split + sms - 1) // sms) / split + reduction_penalty * (split - 1)
+    ))
+    if query.recipe == "nvfp4" and m <= 16 and split_k == 1:
+        tile_k = 128
+    return BlockscaledConfig(
+        mode="a16", tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, split_k=split_k,
+    )
+
+
+def _gb10_a16_default_config(query, device):
+    if query.recipe == "mxfp8" or device is None:
+        if _automatic_a16(query, device):
+            return BlockscaledConfig(mode="a16", tile_n=128, tile_k=64, split_k=4)
+        return BlockscaledConfig(mode="a16", tile_n=64, tile_k=64, split_k=1)
+    m, n, k = query.num_tokens, query.out_features, query.in_features
+    sms = device.sm_count
+    iq2 = query.recipe in ("iq2_xs", "iq2_xxs")
+
+    def fits_split(split):
+        return split == 1 or query.workspace_nbytes is None or (
+            split * m * n * 4 <= query.workspace_nbytes
+        )
+
+    if query.recipe == "q8_0" and m <= 16 and n >= 64 * sms and k >= 128 * m:
+        if n >= 128 * sms and m >= 8:
+            return BlockscaledConfig(
+                mode="a16", tile_m=8, tile_n=64, tile_k=256, split_k=1,
+            )
+        # Short K partitions expose independent Q8 loads even with a wide grid.
+        split = max(s for s in (1, 2, 4, 8) if (s == 1 or k // s >= 128) and fits_split(s))
+        return BlockscaledConfig(
+            mode="a16", tile_m=16, tile_n=64,
+            tile_k=256 if k >= 2048 else 64, split_k=split,
+        )
+    if query.recipe in BLOCK_CODECS and m <= 8:
+        if iq2 and n >= 128 * sms:
+            return BlockscaledConfig(
+                mode="a16", tile_m=8, tile_n=128 if m == 2 else 64,
+                tile_k=256, split_k=1,
+            )
+        # SIMT avoids tile staging for N8 packing and low-reuse GEMVs.
+        if n % 128 or (iq2 and m == 1) or (m <= 2 and ((iq2 and n >= k) or k <= 1024)):
+            rows = max(1, m // (2 if m <= 4 else 4)) if n % 128 else 1 << (m - 1).bit_length()
+            return BlockscaledConfig(
+                mode="a16", tile_m=rows, tile_n=4, tile_k=256, split_k=1,
+            )
+        if iq2 and m <= 2 and n >= 64 * sms:
+            return BlockscaledConfig(
+                mode="a16", tile_m=8, tile_n=128, tile_k=128, split_k=1,
+            )
+        if n >= 128 * sms:
+            return BlockscaledConfig(
+                mode="a16", tile_m=8, tile_n=64, tile_k=256, split_k=1,
+            )
+    tile_m = (32 if m >= 32 else 16) if iq2 else max(16, min(64, 1 << (m.bit_length() - 1)))
+    if query.recipe == "nvfp4" and m > 16 and (n + 127) // 128 >= sms / 2:
+        tile_m = 32
+    rows = (m + tile_m - 1) // tile_m
+    wide = rows * ((n + 127) // 128) >= sms / 2
+    if query.recipe == "q8_0" and m > 16:
+        grid128 = rows * ((n + 127) // 128)
+        wide = grid128 >= sms / 3 and not sms / 2 < grid128 < sms
+    tile_n = 128 if (
+        query.recipe == "nvfp4"
+        or (m > 16 and (iq2 or n % 128 or wide))
+        or (m == 16 and (n % 128 or (iq2 and n >= 128 * sms)))
+        or (query.recipe == "q8_0" and (n >= k or (m == 1 and n <= 16 * sms)))
+    ) else 64
+    tile_k = (128 if m <= 16 else 256) if iq2 else 64
+    if iq2 and m >= 32:
+        tile_n, tile_k = (128 if n >= k else 64), 64
+    elif iq2 and m == 16 and n >= 128 * sms:
+        tile_k = 256
+    grid = rows * ((n + tile_n - 1) // tile_n)
+    splits = [1]
+    balance_tail = (query.recipe == "q8_0" and m > 16) or (iq2 and m <= 8)
+    if grid < sms * (2 if balance_tail else 1):
+        for split in (2, 4, 8):
+            if k // split >= 512 and fits_split(split):
+                splits.append(split)
+    # Extra partitions must offset their partial-output and reduction overhead.
+    reduction_penalty = 0.005 if iq2 else 0.04 if query.recipe == "q8_0" and n % 128 == 0 else 0.025
     split_k = min(splits, key=lambda split: (
         ((grid * split + sms - 1) // sms) / split + reduction_penalty * (split - 1)
     ))
