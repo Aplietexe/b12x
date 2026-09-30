@@ -296,6 +296,7 @@ def validate_moe_decode_config(
     config: MoeDecodeConfig,
     _device: DeviceIdentity | None,
 ) -> None:
+    """Reject a decode config the query's recipe cannot execute."""
     _validate_block_moe_launch(query, config)
     if query.source_format in BLOCK_CODECS:
         if query.quant_mode != "w4a16" or query.io_dtype != "bfloat16":
