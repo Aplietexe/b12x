@@ -1,4 +1,4 @@
-"""Lossless TP slicing of DS4.1 E2M1 weights and compressed UE8M0 scales."""
+"""Lossless TP slicing of E2M1 experts and compressed UE8M0 scales."""
 
 from __future__ import annotations
 
@@ -28,10 +28,12 @@ def checkpoint_contract(root: str) -> dict:
     for key, value in (
         ("schema", SCHEMA),
         ("codec", CODEC),
-        ("family", "deepseek_v41"),
     ):
         if manifest.get(key) != value or contract.get(key) != value:
             raise ValueError(f"X4T requires {key}={value!r}")
+    family = contract.get("family")
+    if family not in ("deepseek_v41", "kimi_k3") or manifest.get("family") != family:
+        raise ValueError("X4T requires a matching DS4.1 or Kimi-K3 family")
     names = contract["source_names"]
     files = {item["file"] for item in manifest["shards"]}
     for name in set(names.values()) | files:
@@ -95,12 +97,19 @@ def read_exact_mxfp4_layer(
     w2_scale_scratch,
 ):
     """Load a gate/up-ordered TP extent; expanded scales remain caller-owned."""
-    if (num_experts, hidden_size, intermediate_size) != (384, 5120, 2304):
-        raise ValueError("X4T serving requires DS4.1's 384/5120/2304 expert geometry")
-    if tp_size not in (1, 2, 4, 8) or not 0 <= tp_rank < tp_size:
-        raise ValueError("X4T DS4.1 supports TP1/2/4/8 with a valid rank")
     root = Path(root)
-    names = checkpoint_contract(str(root.resolve()))["source_names"]
+    contract = checkpoint_contract(str(root.resolve()))
+    family = contract["family"]
+    expected_geometry = {
+        "deepseek_v41": (384, 5120, 2304),
+        "kimi_k3": (896, 3584, 3072),
+    }[family]
+    supported_tp = (1, 2, 4, 8) if family == "deepseek_v41" else (1, 2, 4, 8, 12, 16)
+    if (num_experts, hidden_size, intermediate_size) != expected_geometry:
+        raise ValueError(f"X4T {family} requires expert geometry {expected_geometry}")
+    if tp_size not in supported_tp or not 0 <= tp_rank < tp_size:
+        raise ValueError(f"X4T {family} supports TP {supported_tp} with a valid rank")
+    names = contract["source_names"]
     local = intermediate_size // tp_size
     first, last = tp_rank * local, (tp_rank + 1) * local
     w13 = torch.empty(
@@ -124,8 +133,15 @@ def read_exact_mxfp4_layer(
         for expert in range(num_experts):
             f13, e13 = [], []
             for matrix, projection in enumerate(("w1", "w3", "w2")):
-                stem = f"layers.{layer_index}.ffn.experts.{expert}.{projection}"
-                name = stem + ".weight"
+                if family == "kimi_k3":
+                    stem = (
+                        f"language_model.model.layers.{layer_index}."
+                        f"block_sparse_moe.experts.{expert}.{projection}"
+                    )
+                    name, scale = stem + ".weight_packed", stem + ".weight_scale"
+                else:
+                    stem = f"layers.{layer_index}.ffn.experts.{expert}.{projection}"
+                    name, scale = stem + ".weight", stem + ".scale"
                 view = handle(name).get_slice(name)
                 expected = (
                     [intermediate_size, hidden_size // 2]
@@ -144,7 +160,6 @@ def read_exact_mxfp4_layer(
                     w2[expert].copy_(view[:, first // 2 : last // 2].view(torch.uint8))
                     rows, columns = hidden_size, intermediate_size // 32
                     row_slice, column_slice = (0, rows), (first // 32, last // 32)
-                scale = stem + ".scale"
                 reader = handle(scale)
                 fixed, exceptions = slice_scale_plane(
                     reader.get_tensor(scale + ".exact_mxfp4_fixed"),
