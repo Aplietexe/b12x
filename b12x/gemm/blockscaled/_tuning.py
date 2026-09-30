@@ -223,7 +223,7 @@ TUNING = TuningContract(
 
 @dataclass(frozen=True, kw_only=True)
 class FixedBlockscaledQuery:
-    """Fixed kernel recipe; serialized block-FP8 accepts dynamic M with expected_m=None."""
+    """Fixed kernel recipe with bounded dynamic M when expected_m is None."""
 
     recipe: str
     call_kind: str
@@ -260,8 +260,6 @@ def _validate_fixed_query(query, device):
             or query.output_dtype not in ("bfloat16", "float16")
             or query.alpha_mode not in ("unit", "tensor")):
         raise ValueError("invalid fixed blockscaled metadata")
-    if query.expected_m is None and (query.call_kind, query.recipe) != ("serialized", "block_fp8"):
-        raise ValueError("dynamic fixed blockscaled rows require serialized block-FP8")
     if query.call_kind == "serialized":
         if (query.recipe not in ("nvfp4", "mxfp4", "block_fp8")
                 or query.in_features != query.padded_in_features
@@ -296,5 +294,5 @@ def _validate_fixed_query(query, device):
 
 FIXED_TUNING = replace(
     make_fixed_contract(component_id="gemm.blockscaled.fixed", query_type=FixedBlockscaledQuery, backend="cutedsl"),
-    query_schema_version=3, validate_query=_validate_fixed_query,
+    query_schema_version=4, validate_query=_validate_fixed_query,
 )
