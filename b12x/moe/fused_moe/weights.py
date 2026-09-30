@@ -189,6 +189,21 @@ class PackedWeights:
 
 
 @dataclass(frozen=True)
+class Nvfp4LscWeights:
+    """Native NVFP4 weights with compressed E4M3 scales and shared scratch.
+
+    FC1 weights and compressed rows use kernel-native up/gate order.
+    The packed bundle's block-scale tensors are caller-owned expansion
+    buffers. Their contents are overwritten before each expert invocation.
+    Separate concurrent execution streams require separate buffers.
+    """
+
+    packed: PackedWeights
+    w13_scales: object
+    w2_scales: object
+
+
+@dataclass(frozen=True)
 class X4TWeights:
     """Exact MXFP4 nibbles, compressed scales and caller-owned expansion buffers.
 
@@ -240,6 +255,7 @@ class PreparedExperts:
 
 
 __all__ = [
+    "Nvfp4LscWeights",
     "X4TWeights",
     "PackedWeights",
     "IQ2XSWeights",

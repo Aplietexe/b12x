@@ -46,6 +46,7 @@ from .trellis_layout import TrellisStaging
 from .weights import (
     PackedWeights,
     X4TWeights,
+    Nvfp4LscWeights,
     IQ2XSWeights,
     BlockQuantWeights,
     PreparedExperts,
@@ -102,7 +103,7 @@ def _canonical_plan_weights(
 
 
 def _canonical_prepare_weights(
-    *, plan: WeightPlan, weights: PackedWeights | TrellisWeights | IQ2XSWeights | X4TWeights,
+    *, plan: WeightPlan, weights: PackedWeights | TrellisWeights | IQ2XSWeights | X4TWeights | Nvfp4LscWeights,
     device: torch.device | str | None = None,
     staging: TrellisStaging | None = None,
 ) -> PreparedExperts:
@@ -246,6 +247,7 @@ __all__ = [
     "PackedSourceFormat",
     "PackedWeights",
     "X4TWeights",
+    "Nvfp4LscWeights",
     "IQ2XSWeights",
     "BlockQuantWeights",
     "PreparedExperts",

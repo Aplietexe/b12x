@@ -448,6 +448,7 @@ class B12XFP4ExpertWeights:
     w2_alphas: torch.Tensor
     representation: _PreparedWeightRepresentation | None = None
     immutable_input_scales: bool = False
+    nvfp4_lsc: object | None = None
     _uniform_a1_scale: bool = field(default=False, init=False, repr=False)
     _a1_scale_version: int | None = field(default=None, init=False, repr=False)
 
@@ -12827,6 +12828,8 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
     w2_alphas = experts.w2_alphas
     topk_weights = binding.topk_weights
     topk_ids = binding.topk_ids
+    if experts.nvfp4_lsc is not None:
+        experts.nvfp4_lsc.decode(topk_ids, w1_blockscale, w2_blockscale)
     workspace = None
     apply_router_weight_on_input = binding.apply_router_weight_on_input
     output = binding.output
