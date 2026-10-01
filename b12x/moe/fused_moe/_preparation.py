@@ -95,12 +95,13 @@ def _control_snapshot() -> FrozenMapping:
     """Capture host controls once while declaring the immutable query."""
     from . import _impl
     from b12x.moe._shared.kernels.w4a16.host import (
-        prefill_fused_sum_enabled,
+        prefill_fused_sum_enabled, trellis_decode_table,
     )
 
     tile = _impl._dynamic_tile_mn_override()
     raw_materialized = _impl.os.environ.get(_impl._DYNAMIC_NVFP4_MATERIALIZED_ENV)
     return FrozenMapping({
+        "trellis_decode_table": trellis_decode_table(),
         "w4a16_prefill_fused_sum": prefill_fused_sum_enabled(),
         "dynamic_nvfp4_materialized": (
             None if raw_materialized is None else raw_materialized not in ("", "0", "false", "False")
@@ -262,6 +263,7 @@ def _lower_caps(
         w4a16_prefill_fused_sum=bool(
             query.controls.get("w4a16_prefill_fused_sum", False)
         ),
+        trellis_decode_table=str(query.controls.get("trellis_decode_table", "auto")),
         swiglu_beta=_decode_scalar(query.swiglu_beta),
     )
 
