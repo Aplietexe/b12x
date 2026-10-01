@@ -12,7 +12,7 @@ import torch
 from safetensors import safe_open
 
 from b12x._lib.quant.x4t_scales import make_x4t_scale_batch
-from b12x.moe.fused_moe.weights import X4TWeights
+from b12x.moe.fused_moe.weights import Mxfp4CsfWeights
 
 SCHEMA = "trellis-exact-mxfp4-checkpoint/1"
 CODEC = "adjacent-pair-fixed-stream-u24-exceptions/1"
@@ -30,19 +30,19 @@ def checkpoint_contract(root: str) -> dict:
         ("codec", CODEC),
     ):
         if manifest.get(key) != value or contract.get(key) != value:
-            raise ValueError(f"X4T requires {key}={value!r}")
+            raise ValueError(f"MXFP4-CSF requires {key}={value!r}")
     family = contract.get("family")
     if family not in ("deepseek_v41", "kimi_k3") or manifest.get("family") != family:
-        raise ValueError("X4T requires a matching DS4.1 or Kimi-K3 family")
+        raise ValueError("MXFP4-CSF requires a matching DS4.1 or Kimi-K3 family")
     names = contract["source_names"]
     files = {item["file"] for item in manifest["shards"]}
     for name in set(names.values()) | files:
         if Path(name).name != name or not name.endswith(".safetensors"):
             raise ValueError(
-                "X4T shard names must be checkpoint-local safetensors files"
+                "MXFP4-CSF shard names must be checkpoint-local safetensors files"
             )
     if set(names.values()) != files:
-        raise ValueError("X4T manifest and source-name index disagree")
+        raise ValueError("MXFP4-CSF manifest and source-name index disagree")
     return contract
 
 
@@ -51,21 +51,21 @@ def slice_scale_plane(fixed, exceptions, rows, columns, row_slice, column_slice)
     r0, r1 = row_slice
     c0, c1 = column_slice
     if not (0 <= r0 < r1 <= rows and r0 % 16 == r1 % 16 == 0):
-        raise ValueError("X4T row slices must contain complete 16-row slabs")
+        raise ValueError("MXFP4-CSF row slices must contain complete 16-row slabs")
     if not 0 <= c0 < c1 <= columns:
-        raise ValueError("X4T column slice is outside the scale plane")
+        raise ValueError("MXFP4-CSF column slice is outside the scale plane")
     if fixed.dtype != torch.uint8 or exceptions.dtype != torch.uint32:
-        raise TypeError("X4T requires uint8 fixed bytes and uint32 exceptions")
+        raise TypeError("MXFP4-CSF requires uint8 fixed bytes and uint32 exceptions")
     selectors = (columns + 7) // 8
     stream = fixed.numpy().reshape(rows // 16, 16 * (1 + selectors))
     bases = stream[:, :16]
     if (bases > 254).any():
-        raise ValueError("X4T palette bases must be in 0..254")
+        raise ValueError("MXFP4-CSF palette bases must be in 0..254")
     bits = np.unpackbits(
         stream[:, 16:].reshape(rows, selectors), axis=1, bitorder="little"
     )
     if bits[:, columns:].any():
-        raise ValueError("X4T unused selector bits must be zero")
+        raise ValueError("MXFP4-CSF unused selector bits must be zero")
     selected = np.packbits(bits[r0:r1, c0:c1], axis=1, bitorder="little")
     result = np.concatenate(
         (bases[r0 // 16 : r1 // 16], selected.reshape((r1 - r0) // 16, -1)), 1
@@ -75,7 +75,7 @@ def slice_scale_plane(fixed, exceptions, rows, columns, row_slice, column_slice)
     if len(words) and (
         positions[-1] >= rows * columns or (positions[1:] <= positions[:-1]).any()
     ):
-        raise ValueError("X4T exception positions must be unique, sorted and in range")
+        raise ValueError("MXFP4-CSF exception positions must be unique, sorted and in range")
     rr, cc = positions // columns, positions % columns
     keep = (rr >= r0) & (rr < r1) & (cc >= c0) & (cc < c1)
     positions = (rr[keep] - r0) * (c1 - c0) + cc[keep] - c0
@@ -106,9 +106,9 @@ def read_exact_mxfp4_layer(
     }[family]
     supported_tp = (1, 2, 4, 8) if family == "deepseek_v41" else (1, 2, 4, 8, 12, 16)
     if (num_experts, hidden_size, intermediate_size) != expected_geometry:
-        raise ValueError(f"X4T {family} requires expert geometry {expected_geometry}")
+        raise ValueError(f"MXFP4-CSF {family} requires expert geometry {expected_geometry}")
     if tp_size not in supported_tp or not 0 <= tp_rank < tp_size:
-        raise ValueError(f"X4T {family} supports TP {supported_tp} with a valid rank")
+        raise ValueError(f"MXFP4-CSF {family} supports TP {supported_tp} with a valid rank")
     names = contract["source_names"]
     local = intermediate_size // tp_size
     first, last = tp_rank * local, (tp_rank + 1) * local
@@ -149,7 +149,7 @@ def read_exact_mxfp4_layer(
                     else [hidden_size, intermediate_size // 2]
                 )
                 if view.get_shape() != expected or view.get_dtype() not in ("I8", "U8"):
-                    raise ValueError(f"X4T nibble geometry/dtype mismatch: {name}")
+                    raise ValueError(f"MXFP4-CSF nibble geometry/dtype mismatch: {name}")
                 if matrix < 2:
                     w13[expert, matrix * local : (matrix + 1) * local].copy_(
                         view[first:last, :].view(torch.uint8)
@@ -197,7 +197,7 @@ def read_exact_mxfp4_layer(
         device=device,
         exception_task_rows=64,
     )
-    return X4TWeights(
+    return Mxfp4CsfWeights(
         w13=w13.to(device),
         w2=w2.to(device),
         w13_scales=batch13,

@@ -7,6 +7,15 @@ import torch
 from b12x.moe.checkpoints.exact_mxfp4 import slice_scale_plane
 
 
+def test_lossless_scale_names_preserve_legacy_type_and_reader_identity():
+    from b12x.moe import fused_moe
+    from b12x.moe.checkpoints import exact_mxfp4, mxfp4_csf
+
+    assert fused_moe.Mxfp4CsfWeights is fused_moe.X4TWeights
+    assert mxfp4_csf.read_mxfp4_csf_layer is exact_mxfp4.read_exact_mxfp4_layer
+    assert mxfp4_csf.slice_scale_plane is slice_scale_plane
+
+
 def decode(fixed, exceptions, rows, columns):
     selectors = (columns + 7) // 8
     stream = fixed.numpy().reshape(rows // 16, 16 * (1 + selectors))

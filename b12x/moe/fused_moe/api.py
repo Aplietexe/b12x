@@ -45,8 +45,11 @@ from .source import PackedSource, PackedSourceFormat, TrellisExtent, TrellisSour
 from .trellis_layout import TrellisStaging
 from .weights import (
     PackedWeights,
+    Mxfp4CsfWeights,
     X4TWeights,
+    Nvfp4CsfWeights,
     Nvfp4LscWeights,
+    Mxfp4LscWeights,
     IQ2XSWeights,
     BlockQuantWeights,
     PreparedExperts,
@@ -103,7 +106,7 @@ def _canonical_plan_weights(
 
 
 def _canonical_prepare_weights(
-    *, plan: WeightPlan, weights: PackedWeights | TrellisWeights | IQ2XSWeights | X4TWeights | Nvfp4LscWeights,
+    *, plan: WeightPlan, weights: PackedWeights | TrellisWeights | IQ2XSWeights | Mxfp4CsfWeights | Nvfp4LscWeights,
     device: torch.device | str | None = None,
     staging: TrellisStaging | None = None,
 ) -> PreparedExperts:
@@ -228,6 +231,7 @@ def is_supported(device=None) -> bool:
 
 
 __all__ = [
+    "clear_caches",
     "Caps",
     "plan",
     "TrellisExtent",
@@ -246,8 +250,11 @@ __all__ = [
     "PackedSource",
     "PackedSourceFormat",
     "PackedWeights",
+    "Mxfp4CsfWeights",
     "X4TWeights",
+    "Nvfp4CsfWeights",
     "Nvfp4LscWeights",
+    "Mxfp4LscWeights",
     "IQ2XSWeights",
     "BlockQuantWeights",
     "PreparedExperts",

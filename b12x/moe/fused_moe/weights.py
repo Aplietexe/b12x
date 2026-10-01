@@ -189,7 +189,7 @@ class PackedWeights:
 
 
 @dataclass(frozen=True)
-class Nvfp4LscWeights:
+class Nvfp4CsfWeights:
     """Native NVFP4 weights with compressed E4M3 scales and shared scratch.
 
     FC1 weights and compressed rows use kernel-native up/gate order.
@@ -204,8 +204,8 @@ class Nvfp4LscWeights:
 
 
 @dataclass(frozen=True)
-class X4TWeights:
-    """Exact MXFP4 nibbles, compressed scales and caller-owned expansion buffers.
+class Mxfp4CsfWeights:
+    """MXFP4-CSF nibbles, one-bit byte offsets and caller-owned scale buffers.
 
     Buffers may be shared only by serialized layer executions on one CUDA
     stream. Concurrent model execution lanes require separate buffers.
@@ -217,6 +217,12 @@ class X4TWeights:
     w2_scales: object
     w13_scale_scratch: torch.Tensor
     w2_scale_scratch: torch.Tensor
+
+
+# Compatibility identities preserve existing imports and serialized objects.
+X4TWeights = Mxfp4CsfWeights
+Mxfp4LscWeights = Mxfp4CsfWeights
+Nvfp4LscWeights = Nvfp4CsfWeights
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -255,7 +261,10 @@ class PreparedExperts:
 
 
 __all__ = [
+    "Nvfp4CsfWeights",
     "Nvfp4LscWeights",
+    "Mxfp4LscWeights",
+    "Mxfp4CsfWeights",
     "X4TWeights",
     "PackedWeights",
     "IQ2XSWeights",
