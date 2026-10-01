@@ -30,14 +30,18 @@ The paired NVFP4 decoder expands FC1 and FC2 in one launch. Preparation
 retains the integer routing ABIs before graph capture, and replay uses
 caller-owned allocations.
 
-## Compatibility
+## Serialized formats
 
-`X4TWeights` is an identity alias for `Mxfp4CsfWeights`. The
-`exact_mxfp4.read_exact_mxfp4_layer` reader remains available. MXFP4 serialized
-schema and codec identifiers, tensor suffixes, and compressed bytes do not
-change. Existing checkpoints require no re-encoding.
+The readers accept `lil-mxfp4-csf-checkpoint/1` and
+`lil-nvfp4-csf-checkpoint/1`, respectively. Scale tensor components use
+`.mxfp4_csf_fixed` / `.mxfp4_csf_exceptions` or
+`.nvfp4_csf_fixed` / `.nvfp4_csf_exceptions` suffixes. Predecessor schemas
+and API aliases are not accepted. Migrate their headers, manifests and
+receipts before loading; the compressed payload values do not need refitting.
 
 MXFP4 and NVFP4 describe different source arithmetic. A shared compressed
 storage concept does not make their weight, scale, or activation formats
-interchangeable. The NVFP4 checkpoint reader supports GLM-5.3-Flash geometry;
+interchangeable. The NVFP4 checkpoint reader supports GLM-5.3-Flash and
+Qwen3.8-Flash-Next geometry (TP extents must contain a multiple of 64
+intermediate channels);
 the MXFP4 reader supports Kimi-K3 and DeepSeek-V4.1-Flash geometry.
