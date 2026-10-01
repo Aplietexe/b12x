@@ -538,11 +538,16 @@ class _Pair:
                 if raw >= Int64(0) and raw < Int64(experts):
                     expert = raw.to(Int32)
                 if mode == Int32(0):
-                    prior = Int32(0)
-                    while prior < slot and expert >= Int32(0):
-                        if ids[prior].to(Int64) == raw:
-                            expert = Int32(-1)
-                        prior += Int32(1)
+                    # Every warp checks the same prefix in parallel. The
+                    # resulting predicate is uniform across the CTA, so only
+                    # the first route may write an expert's scale region.
+                    duplicate = cutlass.Boolean(False)
+                    prior = Int32(tid) % Int32(32)
+                    while prior < slot:
+                        duplicate = duplicate | (ids[prior].to(Int64) == raw)
+                        prior += Int32(32)
+                    if cute.arch.vote_any_sync(duplicate):
+                        expert = Int32(-1)
         if expert >= Int32(0) and expert < experts:
             if task < Int32(self.first.tasks):
                 self.first.decode(first, expert, task, Int32(tid))
@@ -583,7 +588,7 @@ def compile_nvfp4_csf_pair(first, second, ids64=False):
         make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4),
         0,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("quant.nvfp4_csf_pair", 4, key),
+        compile_spec=KernelCompileSpec.from_key("quant.nvfp4_csf_pair", 5, key),
     )
 
 
@@ -688,9 +693,13 @@ class Nvfp4CsfDecoder:
     first: Nvfp4CsfBatch
     second: Nvfp4CsfBatch
     programs: tuple
+    routing_programs: tuple
+    active: torch.Tensor
 
     @classmethod
     def prepare(cls, first, second, out13, out2):
+        from b12x._lib.quant.csf_routing import compile_csf_active_experts
+
         for plane, output in ((first, out13), (second, out2)):
             plane.validate()
             expected = (
@@ -713,12 +722,30 @@ class Nvfp4CsfDecoder:
             compile_nvfp4_csf_pair(first.geometry, second.geometry, ids64)
             for ids64 in (False, True)
         )
-        return cls(first, second, programs)
+        return cls(
+            first,
+            second,
+            programs,
+            tuple(compile_csf_active_experts(ids64) for ids64 in (False, True)),
+            torch.empty(
+                first.num_experts, dtype=torch.int32, device=first.fixed.device
+            ),
+        )
 
     def decode(self, ids, out13, out2, *, barriers=None):
-        # Sparse calls expand only selected experts. Above one route per
-        # expert on average, a full grid bounds duplicate-search work.
-        mode = 0 if ids.numel() < self.first.num_experts else 3
+        from b12x._lib.quant.csf_routing import mark_active_experts
+
+        # Build presence once for batch decode. Repeated token routes do not
+        # imply that every expert is active. Long prefills bound the scan work
+        # by expanding the complete, statically sized expert set instead.
+        mode = 0
+        if ids.numel() >= 16 * self.first.num_experts:
+            mode = 3
+        elif ids.numel() >= 64:
+            mark_active_experts(
+                ids, self.active, self.routing_programs[int(ids.dtype == torch.int64)]
+            )
+            ids, mode = self.active, 2
         decode_nvfp4_csf_pair(
             self.first,
             self.second,

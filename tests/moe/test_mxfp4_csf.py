@@ -1,88 +1,76 @@
-"""Compressed scales preserve native NVFP4 expert output under graph replay."""
+"""MXFP4-CSF preserves native W4A8 expert math and serialized scale scratch."""
 
-from dataclasses import replace
-
-import numpy as np
 import pytest
 import torch
 
-from b12x._lib.quant.nvfp4_csf import make_nvfp4_csf_batch
 from b12x.moe import fused_moe as moe
 from b12x.preparation import PreparationSession, PreparedCall
-from .test_nvfp4_phase_kernels import _build_domain
 from ..conftest import require_b12x
+from ..quantization.test_mxfp4_csf import fixture
 
 
-def compress_fixture(swizzled, rows, columns, raw=False):
-    """Build valid byte-window records independently from GPU expansion."""
-    e = swizzled.shape[0]
-    logical = swizzled.view(torch.uint8).reshape(e, rows // 128, columns // 4, 32, 4, 4)
-    logical = logical.permute(0, 1, 4, 3, 2, 5).contiguous().reshape(e, rows, columns)
-    fixed, exceptions = [], []
-    for source in logical.cpu().numpy():
-        base = np.minimum(source.min(axis=1), 240).astype(np.uint8)
-        offsets = source.astype(np.int16) - base[:, None]
-        outside = offsets > 15
-        offsets[outside] = 0
-        offsets = offsets.astype(np.uint8)
-        packed = offsets[:, ::2] | (offsets[:, 1::2] << 4)
-        fixed.append(
-            np.concatenate((base.reshape(-1, 16), packed.reshape(rows // 16, -1)), 1)
-        )
-        pos = np.flatnonzero(outside).astype(np.uint32)
-        exceptions.append(pos | (source.ravel()[pos].astype(np.uint32) << 24))
-    if raw:
-        return moe.CsfScalePlanes(
-            tuple(torch.from_numpy(p) for p in fixed),
-            tuple(torch.from_numpy(p) for p in exceptions),
-        )
-    return make_nvfp4_csf_batch(
-        fixed, exceptions, rows=rows, columns=columns, device=swizzled.device
-    )
-
-
+@pytest.mark.parametrize("tokens", [1, 17, 33, 128])
+@pytest.mark.parametrize("h,n", [(512, 192), (5120, 576), (512, 256)])
 @pytest.mark.parametrize("raw", [False, True])
-@pytest.mark.parametrize("tokens", [1, 17, 33])
-@pytest.mark.parametrize("activation_mode", ["a4", "a16"])
-def test_native_expert_output_and_shared_scratch_poisoned_replay(
-    tokens, activation_mode, raw
-):
+def test_native_expert_output_and_shared_scratch_poisoned_replay(tokens, h, n, raw):
     device = require_b12x()
-    e, h, n, topk = 8, 256, 128, 2
-    domain = _build_domain(E=e, K=h, n=n, m=tokens, top_k=topk, seed=931)
+    e, topk = 8, 2
+    first, s13 = fixture(2 * n, h // 32, finite_scales=True)
+    second, s2 = fixture(h, n // 32, finite_scales=True)
+    if raw:
+
+        def cpu_planes(batch):
+            offsets = batch.exception_offsets.cpu().tolist()
+            fixed = tuple(t.cpu() for t in batch.fixed)
+            exceptions = batch.exceptions.cpu()
+            return moe.CsfScalePlanes(
+                fixed,
+                tuple(
+                    exceptions[start:end]
+                    for start, end in zip(offsets[:-1], offsets[1:], strict=True)
+                ),
+            )
+
+        first, second = cpu_planes(first), cpu_planes(second)
+    w13 = torch.randint(0, 256, (e, 2 * n, h // 2), dtype=torch.uint8, device=device)
+    w2 = torch.randint(0, 256, (e, h, n // 2), dtype=torch.uint8, device=device)
+    one = torch.ones(e, device=device)
     weight_plan = moe.plan_weights(
-        source=moe.PackedSource(format="modelopt_nvfp4", w13_layout="w13"),
+        source=moe.PackedSource(format="fp4_e8m0_k32", w13_layout="w31"),
         activation=moe.ActivationSpec(
-            mode=activation_mode,
-            nonlinearity="silu",
-            io_dtype=torch.bfloat16,
-            swiglu_limit=10.0,
+            mode="a8", nonlinearity="silu", io_dtype=torch.bfloat16
         ),
         geometry=moe.MoEGeometry(num_experts=e, hidden_size=h, intermediate_size=n),
     )
-    s13 = domain["w13_sfb"].view(torch.float8_e4m3fn).view(e, 2 * n, h // 16)
-    s2 = domain["w2_sfb"].view(torch.float8_e4m3fn).view(e, h, n // 16)
-    one = torch.ones(e, device=device)
     packed = moe.PackedWeights(
-        w13=domain["w13_packed"],
-        w2=domain["w2_packed"],
+        w13=w13.clone(),
+        w2=w2.clone(),
         w13_block_scales=s13,
         w2_block_scales=s2,
         w13_global_scales=one,
         w2_global_scales=one,
-        input_scale=one,
-        intermediate_scale=one,
-        immutable_input_scales=True,
     )
     buffers = (torch.empty_like(s13), torch.empty_like(s2))
-    compressed = moe.Nvfp4CsfWeights(
-        packed=replace(packed, w13_block_scales=buffers[0], w2_block_scales=buffers[1]),
-        w13_scales=compress_fixture(s13, 2 * n, h // 16, raw=raw),
-        w2_scales=compress_fixture(s2, h, n // 16, raw=raw),
+    compressed = moe.Mxfp4CsfWeights(
+        w13=w13,
+        w2=w2,
+        w13_scales=first,
+        w2_scales=second,
+        w13_scale_scratch=buffers[0],
+        w2_scale_scratch=buffers[1],
     )
     experts = [
         moe.prepare_weights(plan=weight_plan, weights=w) for w in (packed, compressed)
     ]
+    impl = experts[1]._impl
+    assert impl.w1_blockscale.data_ptr() == buffers[0].data_ptr()
+    assert impl.w2_blockscale.data_ptr() == buffers[1].data_ptr()
+    assert impl.representation.value.w13_sfb.data_ptr() == buffers[0].data_ptr()
+    assert impl.representation.value.w2_sfb.data_ptr() == buffers[1].data_ptr()
+    for attr in ("w1_fp4", "w2_fp4", "w1_blockscale", "w2_blockscale"):
+        assert torch.equal(
+            getattr(experts[0]._impl, attr), getattr(experts[1]._impl, attr)
+        )
     plans = [
         moe.plan_execution(
             experts=owner,
@@ -92,7 +80,11 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(
         )
         for owner in experts
     ]
-    source, ids, probabilities = domain["x"], domain["topk_ids"], domain["topk_weights"]
+    source = torch.randn(tokens, h, dtype=torch.bfloat16, device=device) * 0.1
+    ids = torch.stack(
+        [torch.randperm(e, device=device)[:topk] for _ in range(tokens)]
+    ).to(torch.int32)
+    probabilities = torch.softmax(torch.randn(tokens, topk, device=device), -1)
 
     def prepare(state):
         scratch = tuple(
@@ -117,7 +109,7 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(
     ) as session:
         session.prepare(
             tuple(
-                p.request(name=f"nvfp4-scale-storage-{i}", prepare_call=prepare)
+                p.request(name=f"mxfp4-scale-storage-{i}", prepare_call=prepare)
                 for i, p in enumerate(plans)
             )
         )

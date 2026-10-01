@@ -1,5 +1,9 @@
 # CSF loading and weight-preparation qualification
 
+The [MXFP8 expert and serving report](mxfp8-serving.md) covers the DS4.1
+activation-policy repair and the composed loading/preparation serving tests.
+The loading comparisons below retain their original source and precision scope.
+
 vLLM reads compressed FP4 checkpoints, validates their manifests and model
 inventories, and slices expert tensors for the selected TP rank. It supplies
 packed weights and canonical CPU scale planes to the ordinary B12X
