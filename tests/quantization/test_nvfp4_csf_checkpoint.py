@@ -12,7 +12,7 @@ from ..conftest import require_b12x
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_reader_preserves_fp32_calibration_with_bf16_default(monkeypatch):
-    from b12x.moe.checkpoints import nvfp4_lsc as reader
+    from b12x.moe.checkpoints import nvfp4_csf as reader
 
     device = require_b12x()
     calibration = torch.linspace(0.013123, 0.056789, 288, dtype=torch.float32)
@@ -43,9 +43,9 @@ def test_reader_preserves_fp32_calibration_with_bf16_default(monkeypatch):
             return Slice(down_weight if ".down_proj." in name else gate_weight)
 
         def get_tensor(self, name):
-            if name.endswith(".nvfp4_lsc_fixed"):
+            if name.endswith(".nvfp4_csf_fixed"):
                 return fixed2 if ".down_proj." in name else fixed13
-            if name.endswith(".nvfp4_lsc_exceptions"):
+            if name.endswith(".nvfp4_csf_exceptions"):
                 return exceptions
             expert = int(name.split(".experts.", 1)[1].split(".", 1)[0])
             if name.endswith(".weight_scale_2"):
@@ -63,13 +63,16 @@ def test_reader_preserves_fp32_calibration_with_bf16_default(monkeypatch):
     monkeypatch.setattr(
         reader,
         "checkpoint_contract",
-        lambda _: {"source_names": defaultdict(lambda: "calibration.safetensors")},
+        lambda _: {
+            "family": "glm53_nvfp4",
+            "source_names": defaultdict(lambda: "calibration.safetensors"),
+        },
     )
     monkeypatch.setattr(reader, "safe_open", lambda *a, **k: nullcontext(Shard()))
     default = torch.get_default_dtype()
     try:
         torch.set_default_dtype(torch.bfloat16)
-        weights = reader.read_nvfp4_lsc_layer(
+        weights = reader.read_nvfp4_csf_layer(
             Path("/synthetic-nvfp4-csf"),
             3,
             num_experts=288,

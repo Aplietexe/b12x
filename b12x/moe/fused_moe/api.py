@@ -45,11 +45,8 @@ from .source import PackedSource, PackedSourceFormat, TrellisExtent, TrellisSour
 from .trellis_layout import TrellisStaging
 from .weights import (
     PackedWeights,
-    Mxfp4CsfWeights,
-    X4TWeights,
     Nvfp4CsfWeights,
-    Nvfp4LscWeights,
-    Mxfp4LscWeights,
+    Mxfp4CsfWeights,
     IQ2XSWeights,
     BlockQuantWeights,
     PreparedExperts,
@@ -60,6 +57,7 @@ from .weights import (
     WeightEncoding,
     WeightPacking,
 )
+
 
 def plan_weights(**kwargs):
     """Plan typed checkpoint sources or the tensor-based quantization contract."""
@@ -106,7 +104,13 @@ def _canonical_plan_weights(
 
 
 def _canonical_prepare_weights(
-    *, plan: WeightPlan, weights: PackedWeights | TrellisWeights | IQ2XSWeights | Mxfp4CsfWeights | Nvfp4LscWeights,
+    *,
+    plan: WeightPlan,
+    weights: PackedWeights
+    | TrellisWeights
+    | IQ2XSWeights
+    | Mxfp4CsfWeights
+    | Nvfp4CsfWeights,
     device: torch.device | str | None = None,
     staging: TrellisStaging | None = None,
 ) -> PreparedExperts:
@@ -166,6 +170,7 @@ def run(*, binding: Binding):
     if plan is not None:
         require_prepared(plan, "moe.decode", binding.a.device)
     return _run(binding=binding)
+
 
 def _state_for(plan: Plan, hidden_states: torch.Tensor):
     root = require_prepared(plan, "moe.decode", hidden_states.device)
@@ -251,10 +256,8 @@ __all__ = [
     "PackedSourceFormat",
     "PackedWeights",
     "Mxfp4CsfWeights",
-    "X4TWeights",
     "Nvfp4CsfWeights",
-    "Nvfp4LscWeights",
-    "Mxfp4LscWeights",
+    "Mxfp4CsfWeights",
     "IQ2XSWeights",
     "BlockQuantWeights",
     "PreparedExperts",

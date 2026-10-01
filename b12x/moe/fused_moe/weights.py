@@ -219,12 +219,6 @@ class Mxfp4CsfWeights:
     w2_scale_scratch: torch.Tensor
 
 
-# Compatibility identities preserve existing imports and serialized objects.
-X4TWeights = Mxfp4CsfWeights
-Mxfp4LscWeights = Mxfp4CsfWeights
-Nvfp4LscWeights = Nvfp4CsfWeights
-
-
 @dataclass(frozen=True, kw_only=True)
 class PreparedExperts:
     """Prepared expert tensors owned by a canonical weight plan."""
@@ -262,10 +256,7 @@ class PreparedExperts:
 
 __all__ = [
     "Nvfp4CsfWeights",
-    "Nvfp4LscWeights",
-    "Mxfp4LscWeights",
     "Mxfp4CsfWeights",
-    "X4TWeights",
     "PackedWeights",
     "IQ2XSWeights",
     "BlockQuantWeights",

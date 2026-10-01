@@ -187,7 +187,7 @@ def test_native_x4t_keeps_nibbles_and_shares_micro_and_prefill_scales():
     )
     experts = fused_moe.prepare_weights(
         plan=plan,
-        weights=fused_moe.X4TWeights(
+        weights=fused_moe.Mxfp4CsfWeights(
             w13=w13,
             w2=w2,
             w13_scales=fc1,

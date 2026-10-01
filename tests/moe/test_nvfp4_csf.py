@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from b12x._lib.quant.nvfp4_lsc import make_nvfp4_lsc_batch
+from b12x._lib.quant.nvfp4_csf import make_nvfp4_csf_batch
 from b12x.moe import fused_moe as moe
 from b12x.preparation import PreparationSession, PreparedCall
 from .test_nvfp4_phase_kernels import _build_domain
@@ -31,20 +31,26 @@ def compress_fixture(swizzled, rows, columns):
         )
         pos = np.flatnonzero(outside).astype(np.uint32)
         exceptions.append(pos | (source.ravel()[pos].astype(np.uint32) << 24))
-    return make_nvfp4_lsc_batch(
+    return make_nvfp4_csf_batch(
         fixed, exceptions, rows=rows, columns=columns, device=swizzled.device
     )
 
 
 @pytest.mark.parametrize("tokens", [1, 17])
-def test_native_expert_output_and_shared_scratch_poisoned_replay(tokens):
+@pytest.mark.parametrize("activation_mode", ["a4", "a16"])
+def test_native_expert_output_and_shared_scratch_poisoned_replay(
+    tokens, activation_mode
+):
     device = require_b12x()
     e, h, n, topk = 8, 256, 128, 2
     domain = _build_domain(E=e, K=h, n=n, m=tokens, top_k=topk, seed=931)
     weight_plan = moe.plan_weights(
         source=moe.PackedSource(format="modelopt_nvfp4", w13_layout="w13"),
         activation=moe.ActivationSpec(
-            mode="a4", nonlinearity="silu", io_dtype=torch.bfloat16, swiglu_limit=10.0
+            mode=activation_mode,
+            nonlinearity="silu",
+            io_dtype=torch.bfloat16,
+            swiglu_limit=10.0,
         ),
         geometry=moe.MoEGeometry(num_experts=e, hidden_size=h, intermediate_size=n),
     )
@@ -63,7 +69,7 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(tokens):
         immutable_input_scales=True,
     )
     buffers = (torch.empty_like(s13), torch.empty_like(s2))
-    compressed = moe.Nvfp4LscWeights(
+    compressed = moe.Nvfp4CsfWeights(
         packed=replace(packed, w13_block_scales=buffers[0], w2_block_scales=buffers[1]),
         w13_scales=compress_fixture(s13, 2 * n, h // 16),
         w2_scales=compress_fixture(s2, h, n // 16),
@@ -141,6 +147,10 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(tokens):
                 buffer.view(torch.uint8).fill_(0x7F)
             for output in outputs:
                 output.fill_(float("nan"))
+            for binding in bindings:
+                if binding.barrier_count is not None:
+                    binding.barrier_count.fill_(123)
+                    binding.barrier_epoch.fill_(-42)
             allocated = torch.cuda.memory_stats(device)["allocation.all.allocated"]
             for graph in graphs:
                 graph.replay()

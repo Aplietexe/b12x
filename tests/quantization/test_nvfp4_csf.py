@@ -6,10 +6,10 @@ import numpy as np
 import pytest
 import torch
 
-from b12x._lib.quant.nvfp4_lsc import (
-    compile_nvfp4_lsc_pair,
-    decode_nvfp4_lsc_pair,
-    make_nvfp4_lsc_batch,
+from b12x._lib.quant.nvfp4_csf import (
+    compile_nvfp4_csf_pair,
+    decode_nvfp4_csf_pair,
+    make_nvfp4_csf_batch,
 )
 from b12x._lib.runtime_control import kernel_resolution_guard
 from ..conftest import require_b12x
@@ -69,7 +69,7 @@ def _fixture(rows, columns, codec, device):
         fixed.append(stream)
         exceptions.append(records)
         logical.append(source)
-    batch = make_nvfp4_lsc_batch(
+    batch = make_nvfp4_csf_batch(
         fixed, exceptions, rows=rows, columns=columns, codec=codec, device=device
     )
     reference = torch.from_numpy(np.stack(logical)).to(device)
@@ -79,9 +79,12 @@ def _fixture(rows, columns, codec, device):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("codec", [0, 1, 2])
 @pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("geometry", [(128, 16, 256, 8), (2048, 256, 4096, 64)])
+@pytest.mark.parametrize(
+    "codec,geometry",
+    [(c, g) for c in (0, 1, 2) for g in ((128, 16, 256, 8), (2048, 256, 4096, 64))]
+    + [(0, (640, 160, 2560, 20))],
+)
 def test_pair_exact_routes_and_poisoned_graph(codec, ids_dtype, geometry):
     device = require_b12x()
     r13, c13, r2, c2 = geometry
@@ -90,12 +93,12 @@ def test_pair_exact_routes_and_poisoned_graph(codec, ids_dtype, geometry):
     out13, out2 = torch.empty_like(expected13), torch.empty_like(expected2)
     invalid = 2**32 + 3 if ids_dtype == torch.int64 else 4
     routes = torch.tensor([3, 1, 3, -1, invalid], dtype=ids_dtype, device=device)
-    program = compile_nvfp4_lsc_pair(
+    program = compile_nvfp4_csf_pair(
         first.geometry, second.geometry, ids_dtype == torch.int64
     )
 
     def run(ids, mode=0):
-        decode_nvfp4_lsc_pair(
+        decode_nvfp4_csf_pair(
             first, second, ids, out13, out2, mode=mode, program=program
         )
 
@@ -112,7 +115,7 @@ def test_pair_exact_routes_and_poisoned_graph(codec, ids_dtype, geometry):
     out2.fill_(0xD6)
     run(routes)
     check({1, 3})
-    with kernel_resolution_guard("NVFP4-LSC retained decoder"):
+    with kernel_resolution_guard("NVFP4-CSF retained decoder"):
         for count in (1, 3, 5):
             run(routes[:count])
         graph = torch.cuda.CUDAGraph()
