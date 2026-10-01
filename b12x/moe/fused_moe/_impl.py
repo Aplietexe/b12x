@@ -5754,7 +5754,8 @@ def _ensure_w13_kernel_order_inplace(
     w1_u8 = w1_fp4.view(torch.uint8)
     if w1_u8.dim() != 3 or int(w1_u8.shape[1]) != 2 * n:
         raise ValueError(
-            f"w31 FC1 weights must be [E, 2n, k//2]; got {tuple(w1_u8.shape)} for n={n}"
+            f"w31 FC1 weights must be [E, 2n, K bytes]; got {tuple(w1_u8.shape)} "
+            f"for n={n}"
         )
     E = int(w1_u8.shape[0])
     # Swap halves a few experts at a time to bound the temporary.
