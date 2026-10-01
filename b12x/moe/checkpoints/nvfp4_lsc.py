@@ -100,8 +100,10 @@ def read_nvfp4_lsc_layer(
     first, last = tp_rank * local, (tp_rank + 1) * local
     w13 = torch.empty((num_experts, 2 * local, hidden_size // 2), dtype=torch.uint8)
     w2 = torch.empty((num_experts, hidden_size, local // 2), dtype=torch.uint8)
-    g13, g2 = torch.empty(num_experts), torch.empty(num_experts)
-    a13, a2 = torch.empty(num_experts), torch.empty(num_experts)
+    # Model loaders may set BF16 as the default dtype. Calibration belongs to
+    # the source FP32 contract and must not be rounded with the model weights.
+    g13, g2 = (torch.empty(num_experts, dtype=torch.float32) for _ in range(2))
+    a13, a2 = (torch.empty(num_experts, dtype=torch.float32) for _ in range(2))
     fixed13, fixed2, exceptions13, exceptions2 = [], [], [], []
     with ExitStack() as stack:
         handles = {}
