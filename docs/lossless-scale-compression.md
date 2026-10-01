@@ -17,28 +17,26 @@ ordinary `plan_weights` / `prepare_weights` interface. Supply decoded scale
 scratch buffers owned by the caller. Serialized layer executions may reuse
 these buffers. Concurrent execution streams require independent scratch.
 
-The tensor loaders are
-`b12x.moe.checkpoints.mxfp4_csf.load_mxfp4_csf_weights` and
-`b12x.moe.checkpoints.nvfp4_csf.load_nvfp4_csf_weights`. Each takes an iterable
-of three `b12x.moe.checkpoints.csf.CsfMatrix` sources per expert, explicit
-geometry and a TP rank/size. MXFP4 expects gate/up/down order; NVFP4 expects
-up/gate/down order. Each source contains a lazy packed-weight view and CPU
-fixed/exception scale tensors. NVFP4 additionally requires the original FP32
-scalar weight and activation calibration.
+Pass compressed CPU scale planes as `CsfScalePlanes(fixed, exceptions)` in
+`w13_scales` and `w2_scales`. Each tuple contains one rank-local tensor per
+expert, in canonical 16-row slab order: fixed bytes are `torch.uint8` and
+exception records are `torch.uint32`. Geometry and codec come from the weight
+plan. MXFP4 uses 32-channel scale groups; NVFP4 uses 16-channel groups and retains
+the source FP32 scalar weight and activation calibration.
 
-These loaders know tensor geometry and compression layout, but have no model
-names, paths, manifests or file ownership. The caller keeps the tensor store
-open until loading returns. Weight views are sliced before materialization;
-only one rank's packed weights and compressed scale batches are uploaded.
-The iterable is consumed once and must contain exactly the declared expert
-count. The resulting weights use the existing `plan_weights` /
-`prepare_weights` API. Tensor-loading alignment does not extend the serving
-geometries accepted by the MoE kernel planner.
+`prepare_weights` uploads the compressed planes, partitions exception ranges,
+and applies the planned scale layout. NVFP4 uses the ordinary packed-weight
+preparation, including its W4A16 normalization when A16 is selected. MXFP4 uses
+the W4A16 preparation path for its planned native or MMA-packed weight layout.
+These operations happen during weight preparation, before graph capture.
+Callers with already resident scale batches may also pass those batches.
 
-The vLLM `mxfp4_csf_loader` and `nvfp4_csf_loader` integrations own checkpoint
-validation, supported model inventories, tensor-name mapping and shard
-lifetimes. Updating to this tensor-source API requires the matching vLLM
-integration; checkpoint bytes, manifests and CLI flags are unchanged.
+vLLM owns CSF manifests, model inventories, tensor names, shard lifetimes and
+TP slicing. Its `mxfp4_csf_loader` and `nvfp4_csf_loader` readers slice packed
+weight views before materialization and produce rank-local weight bundles.
+B12X has no CSF checkpoint reader or model-file discovery API. Updating this
+integration requires the matching B12X `CsfScalePlanes` support; serialized
+checkpoints, tensor bytes and launch flags are unchanged.
 
 GPU decoding writes the native scale layout directly. Exception ranges are
 partitioned at load time; a thread block patches only its output rows.

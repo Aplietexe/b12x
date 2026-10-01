@@ -13,7 +13,7 @@ from .test_nvfp4_phase_kernels import _build_domain
 from ..conftest import require_b12x
 
 
-def compress_fixture(swizzled, rows, columns):
+def compress_fixture(swizzled, rows, columns, raw=False):
     """Build valid byte-window records independently from GPU expansion."""
     e = swizzled.shape[0]
     logical = swizzled.view(torch.uint8).reshape(e, rows // 128, columns // 4, 32, 4, 4)
@@ -31,15 +31,21 @@ def compress_fixture(swizzled, rows, columns):
         )
         pos = np.flatnonzero(outside).astype(np.uint32)
         exceptions.append(pos | (source.ravel()[pos].astype(np.uint32) << 24))
+    if raw:
+        return moe.CsfScalePlanes(
+            tuple(torch.from_numpy(p) for p in fixed),
+            tuple(torch.from_numpy(p) for p in exceptions),
+        )
     return make_nvfp4_csf_batch(
         fixed, exceptions, rows=rows, columns=columns, device=swizzled.device
     )
 
 
+@pytest.mark.parametrize("raw", [False, True])
 @pytest.mark.parametrize("tokens", [1, 17])
 @pytest.mark.parametrize("activation_mode", ["a4", "a16"])
 def test_native_expert_output_and_shared_scratch_poisoned_replay(
-    tokens, activation_mode
+    tokens, activation_mode, raw
 ):
     device = require_b12x()
     e, h, n, topk = 8, 256, 128, 2
@@ -71,8 +77,8 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(
     buffers = (torch.empty_like(s13), torch.empty_like(s2))
     compressed = moe.Nvfp4CsfWeights(
         packed=replace(packed, w13_block_scales=buffers[0], w2_block_scales=buffers[1]),
-        w13_scales=compress_fixture(s13, 2 * n, h // 16),
-        w2_scales=compress_fixture(s2, h, n // 16),
+        w13_scales=compress_fixture(s13, 2 * n, h // 16, raw=raw),
+        w2_scales=compress_fixture(s2, h, n // 16, raw=raw),
     )
     experts = [
         moe.prepare_weights(plan=weight_plan, weights=w) for w in (packed, compressed)

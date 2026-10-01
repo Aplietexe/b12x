@@ -22,6 +22,7 @@ from .config import TrellisConfig
 from .source import PackedSource, TrellisSource, WeightSource
 from .trellis_layout import TrellisStaging
 from .weights import (
+    CsfScalePlanes,
     Nvfp4CsfWeights,
     PackedWeights,
     Mxfp4CsfWeights,
@@ -373,7 +374,11 @@ def prepare_weights(
             "device and staging are only supported for trellis preparation"
         )
     if isinstance(weights, Nvfp4CsfWeights):
-        from b12x._lib.quant.nvfp4_csf import Nvfp4CsfDecoder, repack_nvfp4_csf_batch
+        from b12x._lib.quant.nvfp4_csf import (
+            Nvfp4CsfDecoder,
+            make_nvfp4_csf_batch,
+            repack_nvfp4_csf_batch,
+        )
 
         if (
             not isinstance(plan.source, PackedSource)
@@ -389,7 +394,30 @@ def prepare_weights(
             raise ValueError(
                 "NVFP4-CSF requires native ModelOpt NVFP4 A4/A16 in up/gate order"
             )
-        planes = (weights.w13_scales, weights.w2_scales)
+        geometry = plan.geometry
+        planes = tuple(
+            make_nvfp4_csf_batch(
+                plane.fixed,
+                plane.exceptions,
+                rows=rows,
+                columns=columns,
+                device=weights.packed.w13.device,
+            )
+            if isinstance(plane, CsfScalePlanes)
+            else plane
+            for plane, rows, columns in (
+                (
+                    weights.w13_scales,
+                    2 * geometry.intermediate_size,
+                    geometry.hidden_size // 16,
+                ),
+                (
+                    weights.w2_scales,
+                    geometry.hidden_size,
+                    geometry.intermediate_size // 16,
+                ),
+            )
+        )
         if plan.activation.mode is ActivationMode.A16:
             from b12x.moe._shared.kernels.w4a16.prepare import (
                 _nvfp4_compute_scale_factor,
@@ -467,15 +495,58 @@ def prepare_weights(
             not isinstance(plan.source, PackedSource)
             or plan.source.format.value != "fp4_e8m0_k32"
             or plan.activation.mode is not ActivationMode.A16
-            or plan.prepared_format.packing not in {
-                WeightPacking.MMA_PACKED, WeightPacking.SOURCE_NATIVE
-            }
+            or plan.prepared_format.packing
+            not in {WeightPacking.MMA_PACKED, WeightPacking.SOURCE_NATIVE}
         ):
-            raise ValueError("MXFP4-CSF requires native or MMA-packed MXFP4 A16 weights")
+            raise ValueError(
+                "MXFP4-CSF requires native or MMA-packed MXFP4 A16 weights"
+            )
+        from b12x._lib.quant.x4t_scales import make_x4t_scale_batch
+
+        geometry = plan.geometry
+        rotation = (
+            geometry.intermediate_size if plan.source.w13_layout.value == "w13" else 0
+        )
+        planes = tuple(
+            make_x4t_scale_batch(
+                plane.fixed,
+                plane.exceptions,
+                rows=rows,
+                columns=columns,
+                device=weights.w13.device,
+                exception_task_rows=64,
+                exception_row_rotation=row_rotation,
+            )
+            if isinstance(plane, CsfScalePlanes)
+            else plane
+            for plane, rows, columns, row_rotation in (
+                (
+                    weights.w13_scales,
+                    2 * geometry.intermediate_size,
+                    geometry.hidden_size // 32,
+                    rotation,
+                ),
+                (
+                    weights.w2_scales,
+                    geometry.hidden_size,
+                    geometry.intermediate_size // 32,
+                    0,
+                ),
+            )
+        )
+        weights = replace(weights, w13_scales=planes[0], w2_scales=planes[1])
         prepared = prepare_b12x_x4t_weights(plan=plan._impl, weights=weights)
-    elif isinstance(plan.source, PackedSource) and plan.source.format.value in BLOCK_CODECS:
-        if not isinstance(weights, IQ2XSWeights) or weights.codec != plan.source.format.value:
-            raise TypeError(f"{plan.source.format.value} preparation requires matching BlockQuantWeights")
+    elif (
+        isinstance(plan.source, PackedSource)
+        and plan.source.format.value in BLOCK_CODECS
+    ):
+        if (
+            not isinstance(weights, IQ2XSWeights)
+            or weights.codec != plan.source.format.value
+        ):
+            raise TypeError(
+                f"{plan.source.format.value} preparation requires matching BlockQuantWeights"
+            )
         prepared = prepare_b12x_iq2_xs_weights(plan=plan._impl, weights=weights)
     elif isinstance(plan.source, TrellisSource):
         if not isinstance(weights, TrellisWeights):
