@@ -24,7 +24,7 @@ from .trellis_layout import TrellisStaging
 from .weights import (
     Nvfp4LscWeights,
     PackedWeights,
-    X4TWeights,
+    Mxfp4CsfWeights,
     IQ2XSWeights,
     PreparedExperts,
     PreparedWeightFormat,
@@ -354,7 +354,7 @@ def plan_weights(
 def prepare_weights(
     *,
     plan: WeightPlan,
-    weights: PackedWeights | TrellisWeights | IQ2XSWeights | X4TWeights | Nvfp4LscWeights,
+    weights: PackedWeights | TrellisWeights | IQ2XSWeights | Mxfp4CsfWeights | Nvfp4LscWeights,
     device: torch.device | str | None = None,
     staging: TrellisStaging | None = None,
 ) -> PreparedExperts:
@@ -374,7 +374,7 @@ def prepare_weights(
             or plan.activation.mode is not ActivationMode.A4
             or plan.activation.a16_max_tokens
         ):
-            raise ValueError("NVFP4-LSC requires native ModelOpt NVFP4 A4 in up/gate order")
+            raise ValueError("NVFP4-CSF requires native ModelOpt NVFP4 A4 in up/gate order")
         prepared = prepare_weights(plan=plan, weights=weights.packed)
         decoder = Nvfp4LscDecoder.prepare(
             weights.w13_scales, weights.w2_scales,
@@ -383,7 +383,7 @@ def prepare_weights(
         return PreparedExperts(
             plan=plan, _impl=replace(prepared._impl, nvfp4_lsc=decoder)
         )
-    if isinstance(weights, X4TWeights):
+    if isinstance(weights, Mxfp4CsfWeights):
         if (
             not isinstance(plan.source, PackedSource)
             or plan.source.format.value != "fp4_e8m0_k32"
@@ -392,7 +392,7 @@ def prepare_weights(
                 WeightPacking.MMA_PACKED, WeightPacking.SOURCE_NATIVE
             }
         ):
-            raise ValueError("X4T requires native or MMA-packed MXFP4 A16 weights")
+            raise ValueError("MXFP4-CSF requires native or MMA-packed MXFP4 A16 weights")
         prepared = prepare_b12x_x4t_weights(plan=plan._impl, weights=weights)
     elif isinstance(plan.source, PackedSource) and plan.source.format.value in BLOCK_CODECS:
         if not isinstance(weights, IQ2XSWeights) or weights.codec != plan.source.format.value:
