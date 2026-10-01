@@ -189,7 +189,7 @@ class PackedWeights:
 
 
 @dataclass(frozen=True)
-class X4TWeights:
+class Mxfp4CsfWeights:
     """Exact MXFP4 nibbles, compressed scales and caller-owned expansion buffers.
 
     Buffers may be shared only by serialized layer executions on one CUDA
@@ -240,7 +240,7 @@ class PreparedExperts:
 
 
 __all__ = [
-    "X4TWeights",
+    "Mxfp4CsfWeights",
     "PackedWeights",
     "IQ2XSWeights",
     "BlockQuantWeights",

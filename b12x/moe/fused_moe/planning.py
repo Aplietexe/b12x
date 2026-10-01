@@ -23,7 +23,7 @@ from .source import PackedSource, TrellisSource, WeightSource
 from .trellis_layout import TrellisStaging
 from .weights import (
     PackedWeights,
-    X4TWeights,
+    Mxfp4CsfWeights,
     IQ2XSWeights,
     PreparedExperts,
     PreparedWeightFormat,
@@ -353,7 +353,7 @@ def plan_weights(
 def prepare_weights(
     *,
     plan: WeightPlan,
-    weights: PackedWeights | TrellisWeights | IQ2XSWeights | X4TWeights,
+    weights: PackedWeights | TrellisWeights | IQ2XSWeights | Mxfp4CsfWeights,
     device: torch.device | str | None = None,
     staging: TrellisStaging | None = None,
 ) -> PreparedExperts:
@@ -363,7 +363,7 @@ def prepare_weights(
         raise TypeError("plan must be a WeightPlan")
     if (device is not None or staging is not None) and not isinstance(plan.source, TrellisSource):
         raise ValueError("device and staging are only supported for trellis preparation")
-    if isinstance(weights, X4TWeights):
+    if isinstance(weights, Mxfp4CsfWeights):
         if (
             not isinstance(plan.source, PackedSource)
             or plan.source.format.value != "fp4_e8m0_k32"

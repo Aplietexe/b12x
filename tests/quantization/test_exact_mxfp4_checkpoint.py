@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from b12x.moe.checkpoints.exact_mxfp4 import slice_scale_plane
+from b12x.moe.checkpoints.mxfp4_csf import slice_scale_plane
 
 
 def decode(fixed, exceptions, rows, columns):

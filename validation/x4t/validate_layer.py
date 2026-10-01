@@ -12,7 +12,7 @@ from safetensors import safe_open
 from b12x._lib.quant.x4t_packed_scales import decode_x4t_packed_scales
 from b12x._lib.runtime_control import kernel_resolution_guard
 from b12x.moe import fused_moe
-from b12x.moe.checkpoints.exact_mxfp4 import checkpoint_contract, read_exact_mxfp4_layer
+from b12x.moe.checkpoints.mxfp4_csf import checkpoint_contract, read_mxfp4_csf_layer
 from tests._reference.helpers import make_tp_moe_fp4_binding
 
 
@@ -66,7 +66,7 @@ def main():
         torch.empty((e, h // 32, 2 * n), dtype=torch.uint8, device=device),
         torch.empty((e, n // 32, h), dtype=torch.uint8, device=device),
     )
-    weights = read_exact_mxfp4_layer(
+    weights = read_mxfp4_csf_layer(
         args.checkpoint,
         args.layer,
         num_experts=e,
