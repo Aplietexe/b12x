@@ -1,49 +1,17 @@
-"""Lossless TP slicing of E2M1 experts and compressed UE8M0 scales."""
+"""Model-independent TP loading of compressed MXFP4 expert tensors."""
 
 from __future__ import annotations
 
-import json
-from contextlib import ExitStack
-from functools import lru_cache
-from pathlib import Path
+from collections.abc import Iterable
 
 import numpy as np
 import torch
-from safetensors import safe_open
 
 from b12x._lib.quant.x4t_scales import make_x4t_scale_batch
+from b12x.moe.checkpoints.csf import CsfMatrix, tp_extent
 from b12x.moe.fused_moe.weights import Mxfp4CsfWeights
 
-SCHEMA = "lil-mxfp4-csf-checkpoint/1"
-CODEC = "row-base-offset1-u24-exceptions/1"
 POSITION_MASK = (1 << 24) - 1
-
-
-@lru_cache(maxsize=4)
-def checkpoint_contract(root: str) -> dict:
-    """Validate the container identity without reading its weight payloads."""
-    directory = Path(root)
-    manifest = json.loads((directory / "manifest.json").read_text())
-    contract = json.loads((directory / "build-contract.json").read_text())
-    for key, value in (
-        ("schema", SCHEMA),
-        ("codec", CODEC),
-    ):
-        if manifest.get(key) != value or contract.get(key) != value:
-            raise ValueError(f"MXFP4-CSF requires {key}={value!r}")
-    family = contract.get("family")
-    if family not in ("deepseek_v41", "kimi_k3") or manifest.get("family") != family:
-        raise ValueError("MXFP4-CSF requires a matching DS4.1 or Kimi-K3 family")
-    names = contract["source_names"]
-    files = {item["file"] for item in manifest["shards"]}
-    for name in set(names.values()) | files:
-        if Path(name).name != name or not name.endswith(".safetensors"):
-            raise ValueError(
-                "MXFP4-CSF shard names must be checkpoint-local safetensors files"
-            )
-    if set(names.values()) != files:
-        raise ValueError("MXFP4-CSF manifest and source-name index disagree")
-    return contract
 
 
 def slice_scale_plane(fixed, exceptions, rows, columns, row_slice, column_slice):
@@ -85,9 +53,8 @@ def slice_scale_plane(fixed, exceptions, rows, columns, row_slice, column_slice)
     return torch.from_numpy(result.copy()), torch.from_numpy(words.astype(np.uint32))
 
 
-def read_mxfp4_csf_layer(
-    root,
-    layer_index,
+def load_mxfp4_csf_weights(
+    experts: Iterable[tuple[CsfMatrix, CsfMatrix, CsfMatrix]],
     *,
     num_experts,
     hidden_size,
@@ -98,26 +65,16 @@ def read_mxfp4_csf_layer(
     w13_scale_scratch,
     w2_scale_scratch,
 ):
-    """Load a gate/up-ordered TP extent; expanded scales remain caller-owned."""
-    root = Path(root)
-    contract = checkpoint_contract(str(root.resolve()))
-    family = contract["family"]
-    expected_geometry = {
-        "deepseek_v41": (384, 5120, 2304),
-        "kimi_k3": (896, 3584, 3072),
-    }[family]
-    supported_tp = (1, 2, 4, 8) if family == "deepseek_v41" else (1, 2, 4, 8, 12, 16)
-    if (num_experts, hidden_size, intermediate_size) != expected_geometry:
-        raise ValueError(
-            f"MXFP4-CSF {family} requires expert geometry {expected_geometry}"
-        )
-    if tp_size not in supported_tp or not 0 <= tp_rank < tp_size:
-        raise ValueError(
-            f"MXFP4-CSF {family} supports TP {supported_tp} with a valid rank"
-        )
-    names = contract["source_names"]
-    local = intermediate_size // tp_size
-    first, last = tp_rank * local, (tp_rank + 1) * local
+    """Slice and upload gate/up/down-ordered expert projections.
+
+    The iterable must yield exactly ``num_experts`` projection triples. Tensor
+    stores, manifests and model-specific tensor names belong to the caller.
+    Expanded scale buffers remain caller-owned for serialized layer execution.
+    """
+    if num_experts <= 0 or hidden_size <= 0 or hidden_size % 64:
+        raise ValueError("MXFP4-CSF requires experts and 64-aligned hidden channels")
+    first, last = tp_extent(intermediate_size, tp_rank, tp_size, 32)
+    local = last - first
     w13 = torch.empty(
         (num_experts, 2 * local, hidden_size // 2), dtype=torch.uint8, device="cpu"
     )
@@ -125,70 +82,53 @@ def read_mxfp4_csf_layer(
         (num_experts, hidden_size, local // 2), dtype=torch.uint8, device="cpu"
     )
     fixed13, fixed2, exceptions13, exceptions2 = [], [], [], []
-    with ExitStack() as stack:
-        handles = {}
-
-        def handle(name):
-            filename = names[name]
-            if filename not in handles:
-                handles[filename] = stack.enter_context(
-                    safe_open(root / "tensors" / filename, framework="pt", device="cpu")
+    for expert, (first_projection, second_projection, down) in zip(
+        range(num_experts), experts, strict=True
+    ):
+        f13, e13 = [], []
+        for matrix, projection in enumerate(
+            (first_projection, second_projection, down)
+        ):
+            view = projection.weight
+            expected = (
+                [intermediate_size, hidden_size // 2]
+                if matrix < 2
+                else [hidden_size, intermediate_size // 2]
+            )
+            if view.get_shape() != expected or view.get_dtype() not in ("I8", "U8"):
+                raise ValueError(
+                    f"MXFP4-CSF nibble geometry/dtype mismatch: expert={expert}, projection={matrix}"
                 )
-            return handles[filename]
-
-        for expert in range(num_experts):
-            f13, e13 = [], []
-            for matrix, projection in enumerate(("w1", "w3", "w2")):
-                if family == "kimi_k3":
-                    stem = (
-                        f"language_model.model.layers.{layer_index}."
-                        f"block_sparse_moe.experts.{expert}.{projection}"
-                    )
-                    name, scale = stem + ".weight_packed", stem + ".weight_scale"
-                else:
-                    stem = f"layers.{layer_index}.ffn.experts.{expert}.{projection}"
-                    name, scale = stem + ".weight", stem + ".scale"
-                view = handle(name).get_slice(name)
-                expected = (
-                    [intermediate_size, hidden_size // 2]
-                    if matrix < 2
-                    else [hidden_size, intermediate_size // 2]
+            if matrix < 2:
+                w13[expert, matrix * local : (matrix + 1) * local].copy_(
+                    view[first:last, :].view(torch.uint8)
                 )
-                if view.get_shape() != expected or view.get_dtype() not in ("I8", "U8"):
-                    raise ValueError(
-                        f"MXFP4-CSF nibble geometry/dtype mismatch: {name}"
-                    )
-                if matrix < 2:
-                    w13[expert, matrix * local : (matrix + 1) * local].copy_(
-                        view[first:last, :].view(torch.uint8)
-                    )
-                    rows, columns = intermediate_size, hidden_size // 32
-                    row_slice, column_slice = (first, last), (0, columns)
-                else:
-                    w2[expert].copy_(view[:, first // 2 : last // 2].view(torch.uint8))
-                    rows, columns = hidden_size, intermediate_size // 32
-                    row_slice, column_slice = (0, rows), (first // 32, last // 32)
-                reader = handle(scale)
-                fixed, exceptions = slice_scale_plane(
-                    reader.get_tensor(scale + ".mxfp4_csf_fixed"),
-                    reader.get_tensor(scale + ".mxfp4_csf_exceptions"),
-                    rows,
-                    columns,
-                    row_slice,
-                    column_slice,
-                )
-                if matrix < 2:
-                    f13.append(fixed)
-                    if matrix:
-                        words = exceptions.numpy().copy()
-                        words += np.uint32(local * columns)
-                        exceptions = torch.from_numpy(words)
-                    e13.append(exceptions)
-                else:
-                    fixed2.append(fixed)
-                    exceptions2.append(exceptions)
-            fixed13.append(torch.cat(f13))
-            exceptions13.append(torch.cat(e13))
+                rows, columns = intermediate_size, hidden_size // 32
+                row_slice, column_slice = (first, last), (0, columns)
+            else:
+                w2[expert].copy_(view[:, first // 2 : last // 2].view(torch.uint8))
+                rows, columns = hidden_size, intermediate_size // 32
+                row_slice, column_slice = (0, rows), (first // 32, last // 32)
+            fixed, exceptions = slice_scale_plane(
+                projection.fixed,
+                projection.exceptions,
+                rows,
+                columns,
+                row_slice,
+                column_slice,
+            )
+            if matrix < 2:
+                f13.append(fixed)
+                if matrix:
+                    words = exceptions.numpy().copy()
+                    words += np.uint32(local * columns)
+                    exceptions = torch.from_numpy(words)
+                e13.append(exceptions)
+            else:
+                fixed2.append(fixed)
+                exceptions2.append(exceptions)
+        fixed13.append(torch.cat(f13))
+        exceptions13.append(torch.cat(e13))
     batch13 = make_x4t_scale_batch(
         fixed13,
         exceptions13,
