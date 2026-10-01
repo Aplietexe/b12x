@@ -448,6 +448,7 @@ class B12XFP4ExpertWeights:
     w2_alphas: torch.Tensor
     representation: _PreparedWeightRepresentation | None = None
     immutable_input_scales: bool = False
+    nvfp4_csf: object | None = None
     _uniform_a1_scale: bool = field(default=False, init=False, repr=False)
     _a1_scale_version: int | None = field(default=None, init=False, repr=False)
 
@@ -2816,8 +2817,6 @@ def _heuristic_moe_decode_config(
         dynamic_route_mode=dynamic_route_mode,
         w4a16_route_mode=None,
     )
-
-
 
 
 def _dynamic_task_geometry(
@@ -7010,6 +7009,33 @@ def prepare_b12x_fp4_moe_weights(
         w2_alphas=canonical_a2,
         representation=representation,
         immutable_input_scales=immutable_input_scales,
+    )
+
+
+def prepare_b12x_x4t_weights(*, plan, weights) -> B12XFP4ExpertWeights:
+    """Keep exact nibbles and compressed scale planes in the expert owner."""
+    from b12x.moe._shared.kernels.w4a16.prepare import prepare_w4a16_x4t_weights
+
+    unit = torch.ones(plan.num_experts, dtype=torch.float32, device=weights.w13.device)
+    native = WeightPreparationTransform.W4A16_NATIVE in plan.transforms
+    value = prepare_w4a16_x4t_weights(
+        weights.w13, weights.w13_scales, unit,
+        weights.w2, weights.w2_scales, unit,
+        weights.w13_scale_scratch, weights.w2_scale_scratch,
+        activation=plan.activation, params_dtype=getattr(torch, plan.io_dtype),
+        w13_layout=plan.w13_layout,
+        weight_layout="modelopt" if native else "packed",
+    )
+    return B12XFP4ExpertWeights(
+        plan=plan, a1_gscale=unit, a2_gscale=unit,
+        w1_fp4=value.w13, w2_fp4=value.w2,
+        w1_blockscale=value.w13_scale, w2_blockscale=value.w2_scale,
+        w1_alphas=value.w13_global_scale, w2_alphas=value.w2_global_scale,
+        representation=_PreparedWeightRepresentation(
+            quant_mode="w4a16",
+            layout=PreparedWeightLayout.SOURCE_NATIVE if native else PreparedWeightLayout.MMA_PACKED,
+            value=value,
+        ),
     )
 
 
@@ -13076,6 +13102,23 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
     w2_alphas = experts.w2_alphas
     topk_weights = binding.topk_weights
     topk_ids = binding.topk_ids
+    csf_reset_barriers = (
+        experts.nvfp4_csf is not None
+        and binding.implementation == "micro"
+        and topk_ids.numel() > 0
+    )
+    if experts.nvfp4_csf is not None:
+        barriers = (
+            (
+                _require_binding_field(binding, "barrier_count"),
+                _require_binding_field(binding, "barrier_epoch"),
+            )
+            if csf_reset_barriers
+            else None
+        )
+        experts.nvfp4_csf.decode(
+            topk_ids, w1_blockscale, w2_blockscale, barriers=barriers
+        )
     workspace = None
     apply_router_weight_on_input = binding.apply_router_weight_on_input
     output = binding.output
@@ -13097,10 +13140,9 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
     if binding.implementation == "micro":
         workspace = TPMicroWorkspace(
             implementation=binding.implementation,
-            # Eager-bind maps views only and no longer zeros the read-before-write
-            # barrier scalars; the launch wrapper must re-zero them in-place each
-            # call (gated on volatile_launch_state), like the W4A16 path.
-            volatile_launch_state=True,
+            # CSF expansion initializes these scalars in its preceding kernel.
+            # Other weights retain the launch wrapper's scalar initialization.
+            volatile_launch_state=not csf_reset_barriers,
             quant_mode=quant_mode,
             state_E=binding.state_E,
             weight_E=binding.weight_E,
@@ -13373,7 +13415,8 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 else None
             ),
             route_mode=(
-                "packed" if binding.route_pack_launches is not None
+                "packed"
+                if binding.route_pack_launches is not None
                 else plan.decode_config.w4a16_route_mode or "auto"
             ),
         )
@@ -13527,7 +13570,9 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
     if compact_w4a8_micro:
         compact = binding.compact_launches
         if compact is None:
-            raise RuntimeError("compact W4A8 execution requires its prepared native launchers")
+            raise RuntimeError(
+                "compact W4A8 execution requires its prepared native launchers"
+            )
         from b12x.moe._shared.kernels.w4a8_compact_micro import (
             launch_w4a8_compact_micro,
         )
@@ -13554,14 +13599,23 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             fast_math=fast_math,
         )
         from b12x.moe._shared.kernels.w4a16.kernel import _w4a16_topk_sum_launch_flat
+
         _w4a16_topk_sum_launch_flat(
-            route_output, scatter_output, m, num_topk, k, "bf16", int(stream),
+            route_output,
+            scatter_output,
+            m,
+            num_topk,
+            k,
+            "bf16",
+            int(stream),
             launcher=compact.topk_sum,
         )
         return scatter_output
 
     if impl == "dynamic":
-        if plan.decode_config.nvfp4_share_input and not experts.can_share_input(input_scales_static=True):
+        if plan.decode_config.nvfp4_share_input and not experts.can_share_input(
+            input_scales_static=True
+        ):
             raise ValueError("input scales changed after shared-input preparation")
         deterministic_output = plan.deterministic_output
         decode_config = plan.decode_config
@@ -13637,10 +13691,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             planned_num_tokens=plan.routed_rows // plan.num_topk,
             dynamic_route_mode=decode_config.dynamic_route_mode or "",
             share_input_across_experts=(
-                (
-                    quant_mode == "nvfp4"
-                    and decode_config.nvfp4_share_input
-                )
+                (quant_mode == "nvfp4" and decode_config.nvfp4_share_input)
                 or (
                     dynamic_w4a8_prepared is not None
                     and _env_flag(

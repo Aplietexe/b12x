@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from b12x._lib.quant.block_codec import BLOCK_CODECS
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 import torch
@@ -16,12 +16,15 @@ from ._impl import (
     prepare_b12x_fp4_moe_weights,
     prepare_b12x_trellis_v2_weights,
     prepare_b12x_iq2_xs_weights,
+    prepare_b12x_x4t_weights,
 )
 from .config import TrellisConfig
 from .source import PackedSource, TrellisSource, WeightSource
 from .trellis_layout import TrellisStaging
 from .weights import (
+    Nvfp4CsfWeights,
     PackedWeights,
+    Mxfp4CsfWeights,
     IQ2XSWeights,
     PreparedExperts,
     PreparedWeightFormat,
@@ -358,7 +361,11 @@ def plan_weights(
 def prepare_weights(
     *,
     plan: WeightPlan,
-    weights: PackedWeights | TrellisWeights | IQ2XSWeights,
+    weights: PackedWeights
+    | TrellisWeights
+    | IQ2XSWeights
+    | Mxfp4CsfWeights
+    | Nvfp4CsfWeights,
     device: torch.device | str | None = None,
     staging: TrellisStaging | None = None,
 ) -> PreparedExperts:
@@ -366,9 +373,114 @@ def prepare_weights(
 
     if not isinstance(plan, WeightPlan):
         raise TypeError("plan must be a WeightPlan")
-    if (device is not None or staging is not None) and not isinstance(plan.source, TrellisSource):
-        raise ValueError("device and staging are only supported for trellis preparation")
-    if isinstance(plan.source, PackedSource) and plan.source.format.value in BLOCK_CODECS:
+    if (device is not None or staging is not None) and not isinstance(
+        plan.source, TrellisSource
+    ):
+        raise ValueError(
+            "device and staging are only supported for trellis preparation"
+        )
+    if isinstance(weights, Nvfp4CsfWeights):
+        from b12x._lib.quant.nvfp4_csf import Nvfp4CsfDecoder, repack_nvfp4_csf_batch
+
+        if (
+            not isinstance(plan.source, PackedSource)
+            or plan.source.format.value != "modelopt_nvfp4"
+            or plan.source.w13_layout.value != "w13"
+            or plan.activation.mode not in (ActivationMode.A4, ActivationMode.A16)
+            or (
+                plan.activation.mode is ActivationMode.A16
+                and plan.prepared_format.packing is not WeightPacking.MMA_PACKED
+            )
+            or plan.activation.a16_max_tokens
+        ):
+            raise ValueError(
+                "NVFP4-CSF requires native ModelOpt NVFP4 A4/A16 in up/gate order"
+            )
+        planes = (weights.w13_scales, weights.w2_scales)
+        if plan.activation.mode is ActivationMode.A16:
+            from b12x.moe._shared.kernels.w4a16.prepare import (
+                _nvfp4_compute_scale_factor,
+                _process_nvfp4_packed_scales,
+            )
+
+            # Standard W4A16 preparation chooses one scale normalization per
+            # projection and packs weights/scales into its MMA layout. Expand
+            # one layer in shared scratch to retain that exact preparation law.
+            source_scales = (
+                weights.packed.w13_block_scales,
+                weights.packed.w2_block_scales,
+            )
+            staging_decoder = Nvfp4CsfDecoder.prepare(*planes, *source_scales)
+            ids = torch.empty(
+                plan.geometry.num_experts,
+                dtype=torch.int32,
+                device=weights.packed.w13.device,
+            )
+            staging_decoder.decode(ids, *source_scales)
+            factors = tuple(
+                _nvfp4_compute_scale_factor(t, plan.activation.io_dtype)
+                for t in source_scales
+            )
+        prepared = prepare_weights(plan=plan, weights=weights.packed)
+        if plan.activation.mode is ActivationMode.A16:
+            representation = prepared._impl.representation
+            packed = representation.value
+            outputs = (
+                source_scales[0].view_as(packed.w13_scale),
+                source_scales[1].view_as(packed.w2_scale),
+            )
+            tables = []
+            for factor in factors:
+                alphabet = torch.arange(
+                    256, dtype=torch.uint8, device=weights.packed.w13.device
+                ).view(torch.float8_e4m3fn)
+                alphabet = (
+                    alphabet[:, None]
+                    .expand(256, 4)
+                    .contiguous()
+                    .to(plan.activation.io_dtype)
+                )
+                tables.append(
+                    _process_nvfp4_packed_scales(alphabet, scale_factor=factor)
+                    .view(torch.uint8)[:, 0]
+                    .contiguous()
+                )
+            planes = tuple(
+                repack_nvfp4_csf_batch(plane, row_rotation=rotation, value_lut=table)
+                for plane, rotation, table in zip(
+                    planes, (plan.geometry.intermediate_size, 0), tables, strict=True
+                )
+            )
+            packed = replace(packed, w13_scale=outputs[0], w2_scale=outputs[1])
+            prepared = replace(
+                prepared,
+                _impl=replace(
+                    prepared._impl,
+                    representation=replace(representation, value=packed),
+                    w1_blockscale=outputs[0],
+                    w2_blockscale=outputs[1],
+                ),
+            )
+        decoder = Nvfp4CsfDecoder.prepare(
+            *planes,
+            prepared._impl.w1_blockscale,
+            prepared._impl.w2_blockscale,
+        )
+        return PreparedExperts(
+            plan=plan, _impl=replace(prepared._impl, nvfp4_csf=decoder)
+        )
+    if isinstance(weights, Mxfp4CsfWeights):
+        if (
+            not isinstance(plan.source, PackedSource)
+            or plan.source.format.value != "fp4_e8m0_k32"
+            or plan.activation.mode is not ActivationMode.A16
+            or plan.prepared_format.packing not in {
+                WeightPacking.MMA_PACKED, WeightPacking.SOURCE_NATIVE
+            }
+        ):
+            raise ValueError("MXFP4-CSF requires native or MMA-packed MXFP4 A16 weights")
+        prepared = prepare_b12x_x4t_weights(plan=plan._impl, weights=weights)
+    elif isinstance(plan.source, PackedSource) and plan.source.format.value in BLOCK_CODECS:
         if not isinstance(weights, IQ2XSWeights) or weights.codec != plan.source.format.value:
             raise TypeError(f"{plan.source.format.value} preparation requires matching BlockQuantWeights")
         prepared = prepare_b12x_iq2_xs_weights(plan=plan._impl, weights=weights)

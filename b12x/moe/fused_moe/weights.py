@@ -189,6 +189,37 @@ class PackedWeights:
                 raise TypeError(f"PackedWeights.{name} must be a tensor or None")
 
 
+@dataclass(frozen=True)
+class Nvfp4CsfWeights:
+    """Native NVFP4 weights with compressed E4M3 scales and shared scratch.
+
+    FC1 weights and compressed rows use kernel-native up/gate order.
+    The packed bundle's block-scale tensors are caller-owned expansion
+    buffers. Their contents are overwritten before each expert invocation.
+    Separate concurrent execution streams require separate buffers.
+    """
+
+    packed: PackedWeights
+    w13_scales: object
+    w2_scales: object
+
+
+@dataclass(frozen=True)
+class Mxfp4CsfWeights:
+    """MXFP4-CSF nibbles, one-bit byte offsets and caller-owned scale buffers.
+
+    Buffers may be shared only by serialized layer executions on one CUDA
+    stream. Concurrent model execution lanes require separate buffers.
+    """
+
+    w13: torch.Tensor
+    w2: torch.Tensor
+    w13_scales: object
+    w2_scales: object
+    w13_scale_scratch: torch.Tensor
+    w2_scale_scratch: torch.Tensor
+
+
 @dataclass(frozen=True, kw_only=True)
 class PreparedExperts:
     """Prepared expert tensors owned by a canonical weight plan."""
@@ -225,6 +256,8 @@ class PreparedExperts:
 
 
 __all__ = [
+    "Nvfp4CsfWeights",
+    "Mxfp4CsfWeights",
     "PackedWeights",
     "IQ2XSWeights",
     "BlockQuantWeights",
